@@ -37,8 +37,30 @@ export OPENAI_API_KEY='your-api-key'
 /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
   --linux-path /root/workspace/linux \
   --output-dir /root/workspace/linux-vuln-set \
-  --count 1
+  --count 1 \
+  --show-progress
 ~~~
+
+如果使用 DeepSeek API（例如当前环境把 key 放在 `DEEPSEEK_API_KEY`），请显式指定
+环境变量、Responses API 地址和模型：
+
+~~~sh
+export DEEPSEEK_API_KEY='your-deepseek-api-key'
+
+/root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
+  --api-key-env DEEPSEEK_API_KEY \
+  --api-base-url https://api.deepseek.com \
+  --model deepseek-flash \
+  --disable code_mode_host \
+  --linux-path /root/workspace/linux \
+  --output-dir /root/workspace/linux-vuln-set \
+  --count 1 \
+  --show-progress
+~~~
+
+`--disable code_mode_host` 只关闭可选的 Code Mode 主机，不影响普通命令执行；如果
+没有构建 `codex-code-mode-host`，建议保留它。DeepSeek 的 Codex 接入使用
+`https://api.deepseek.com` 的 Responses API。
 
 上面的命令省略了 `--model`，因此每个子进程会继承 `~/.codex/config.toml`
 中的 `model` 配置。`your-model` 只是占位符，不能原样输入。需要覆盖时，
@@ -86,8 +108,9 @@ api-base-url 必须兼容 OpenAI Responses API。若没有外部 API key 但希�
 - commit：优先检查的 commit 或 revision。
 - api-key-env：外部 API key 所在的环境变量名。
 - api-base-url：可选的 OpenAI-compatible Responses API 地址。
-- sandbox：默认是 read-only；可选 workspace-write 或 danger-full-access。
+- sandbox：默认是 workspace-write；可选 read-only 或 danger-full-access。
 - dangerously-bypass-approvals-and-sandbox：只建议在隔离研究虚拟机中使用。
+- show-progress：实时显示子进程的 Codex 风格进度、命令、命令输出和最终消息；也可写成 verbose。
 - dry-run：只生成 prompt 和执行命令，不调用模型。
 - stop-on-error：某一候选失败时立即停止后续候选。
 
@@ -127,7 +150,27 @@ PROCESS_LOG.md 记录编排器的启动参数、每个候选的开始和结束�
 5. 默认不修改 Linux 源码，使用 out-of-tree 构建和候选目录。
 6. 找不到稳定候选时必须报告 negative 或 inconclusive，而不是编造漏洞。
 
-默认 read-only 沙箱保护内核源码，output-dir 和 candidate-NNN 会通过 add-dir 授予写权限。若实验确实需要 QEMU、挂载或其他超出沙箱的操作，使用 dangerously-bypass 之前应先确认当前环境是专用隔离实验环境。
+子代理不会把 output-dir 之外的既有研究目录、旧 PoC、审查记录或外部漏洞数据库作为
+发现证据；如果这些材料可见，只能用来排除候选，不能复制或改写成新结果。
+
+默认 workspace-write 沙箱把 candidate-NNN 作为子代理工作目录，并把 output-dir 和
+candidate-NNN 作为可写证据目录；Linux 源码目录只作为显式读取目标，不加入可写根，
+因此模型可以保存 PoC 和日志而不会改写源码。不能使用 `--sandbox read-only`，因为
+子代理无法保存证据；若实验确实需要 QEMU、挂载或其他超出沙箱的操作，使用
+dangerously-bypass 之前应先确认当前环境是专用隔离实验环境。
+
+## 实时观察子进程
+
+默认情况下，编排器会等待候选子进程结束后再把完整事件写入 agent-events.jsonl。
+如果希望像普通 Codex 会话一样观察实时进度，增加：
+
+~~~sh
+--show-progress
+~~~
+
+也可以使用别名 --verbose。该选项会在终端显示命令、命令输出、工具调用、思考摘要
+和最终消息，同时仍保存完整的 agent-events.jsonl 与 agent-stderr.log。不加该选项
+则保持安静模式，适合脚本或只查看最终证据。
 
 ## 与已有 codex exec 的关系
 

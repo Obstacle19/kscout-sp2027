@@ -77,6 +77,10 @@ Required constraints:
 Discovery discipline:
 
 - Start from code and commit history in the supplied tree.
+- Do not mine unrelated pre-existing research directories, prior PoCs, review
+  records, or external finding databases for a candidate. If such artifacts are
+  visible in the environment, treat them as contaminated leads that may only be
+  used to exclude a result, never as discovery evidence or a reproduction.
 - Prefer bugs in ordinary local or virtualized configurations and filesystem,
   syscall, namespace, IPC, or network paths that can be exercised without
   special hardware.
@@ -84,6 +88,9 @@ Discovery discipline:
 - Validate the positive result, a close negative control, and a clean rerun.
 - If a candidate is already repaired in the current tree, exclude it rather
   than presenting it as newly found.
+- If the mechanism or PoC exists only in a pre-existing artifact outside the
+  candidate directory, report it as excluded and continue auditing the supplied
+  source; do not copy or adapt it into the result.
 
 Deliverables in the candidate directory:
 
@@ -137,8 +144,10 @@ pub(crate) struct KernelVulnCommand {
     #[arg(long = "commit", value_name = "REVISION")]
     commit: Option<String>,
 
-    /// Sandbox mode for the child agent. The default protects the source tree.
-    #[arg(long, value_enum, default_value = "read-only")]
+    /// Sandbox mode for the child agent. The default permits evidence writes
+    /// below the candidate/output roots while keeping the Linux source tree
+    /// outside the writable roots.
+    #[arg(long, value_enum, default_value = "workspace-write")]
     sandbox: SandboxModeCliArg,
 
     /// Allow the child agent to run without approvals and without sandboxing.
@@ -156,6 +165,11 @@ pub(crate) struct KernelVulnCommand {
     #[arg(long = "stop-on-error")]
     stop_on_error: bool,
 
+    /// Stream Codex-style child progress, tool calls, command output, and
+    /// agent messages to the terminal while preserving the raw event logs.
+    #[arg(long = "show-progress", visible_alias = "verbose")]
+    show_progress: bool,
+
     /// Generate prompts and command files without contacting the model.
     #[arg(long)]
     dry_run: bool,
@@ -170,6 +184,7 @@ struct RunOptions<'a> {
     model: Option<&'a str>,
     sandbox: SandboxModeCliArg,
     dangerous_bypass: bool,
+    show_progress: bool,
 }
 
 pub(crate) async fn run(
@@ -190,12 +205,17 @@ pub(crate) async fn run(
         dangerously_bypass_approvals_and_sandbox,
         allow_stored_auth,
         stop_on_error,
+        show_progress,
         dry_run,
     } = command;
 
     ensure!(
         (1..=100).contains(&count),
         "--count must be between 1 and 100"
+    );
+    ensure!(
+        dangerously_bypass_approvals_and_sandbox || !matches!(sandbox, SandboxModeCliArg::ReadOnly),
+        "kernel-vuln must be able to save candidate evidence; use --sandbox workspace-write (the default) or --dangerously-bypass-approvals-and-sandbox"
     );
     validate_environment_variable_name(&api_key_env)?;
     validate_api_base_url(api_base_url.as_deref())?;
@@ -235,6 +255,7 @@ pub(crate) async fn run(
         model: model.as_deref(),
         sandbox,
         dangerous_bypass: dangerously_bypass_approvals_and_sandbox,
+        show_progress,
     };
     initialize_output_files(&run_options, &process_log)?;
 
@@ -253,6 +274,7 @@ pub(crate) async fn run(
              - Commit scope: {}\n\
              - Sandbox: {}\n\
              - Dangerous bypass: {dangerously_bypass_approvals_and_sandbox}\n\
+             - Live progress: {show_progress}\n\
              - Dry run: {dry_run}\n",
             linux_path.display(),
             output_dir.display(),
@@ -308,6 +330,7 @@ pub(crate) async fn run(
                  - model: {}\n\
                  - sandbox: {}\n\
                  - dangerous bypass: {}\n\
+                 - live progress: {}\n\
                  - prompt: prompt.md\n\
                  - event log: agent-events.jsonl\n\
                  - stderr log: agent-stderr.log\n",
@@ -319,6 +342,7 @@ pub(crate) async fn run(
                 model.as_deref().unwrap_or("config/default"),
                 sandbox_name(sandbox),
                 dangerously_bypass_approvals_and_sandbox,
+                show_progress,
             ),
         )
         .with_context(|| format!("writing metadata in {}", candidate_dir.display()))?;
@@ -352,10 +376,11 @@ pub(crate) async fn run(
         let result = run_agent(
             &executable,
             &args,
-            &linux_path,
+            &candidate_dir,
             &candidate_dir,
             api_key.as_deref(),
             &prompt,
+            show_progress,
         )
         .await;
 

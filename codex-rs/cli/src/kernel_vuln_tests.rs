@@ -1,3 +1,4 @@
+use super::kernel_vuln_support::LiveProgressRenderer;
 use super::*;
 use codex_utils_cli::CliConfigOverrides;
 use pretty_assertions::assert_eq;
@@ -27,6 +28,7 @@ fn child_command_keeps_api_key_out_of_argv() {
         model: Some("research-model"),
         sandbox: SandboxModeCliArg::ReadOnly,
         dangerous_bypass: false,
+        show_progress: true,
     };
     let args = build_child_args(
         &CliConfigOverrides::default(),
@@ -38,8 +40,29 @@ fn child_command_keeps_api_key_out_of_argv() {
 
     assert!(!rendered.contains("sk-secret"));
     assert!(rendered.contains("exec"));
+    assert!(rendered.contains("--cd /tmp/output/candidates/candidate-001"));
     assert!(rendered.contains("--sandbox read-only"));
     assert!(rendered.ends_with(" -"));
+}
+
+#[test]
+fn live_progress_renderer_tracks_incremental_command_output() {
+    let mut renderer = LiveProgressRenderer::default();
+
+    renderer.render_json_line(
+        br#"{"type":"item.started","item":{"id":"cmd-1","type":"command_execution","command":"git status","status":"in_progress"}}"#,
+    );
+    renderer.render_json_line(
+        br#"{"type":"item.updated","item":{"id":"cmd-1","type":"command_execution","aggregated_output":"clean\n","status":"in_progress"}}"#,
+    );
+    renderer.render_json_line(
+        br#"{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"candidate checked"}}"#,
+    );
+
+    assert_eq!(
+        renderer.command_output.get("cmd-1").map(String::as_str),
+        Some("clean\n")
+    );
 }
 
 #[test]

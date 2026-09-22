@@ -7,6 +7,8 @@ use anyhow::bail;
 use anyhow::ensure;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SandboxModeCliArg;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -18,7 +20,10 @@ use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
 use tokio::process::Command;
 
 pub(super) fn initialize_output_files(
@@ -37,7 +42,8 @@ pub(super) fn initialize_output_files(
              - API base URL: {}\n\
              - Model: {}\n\
              - Sandbox: {}\n\
-             - Dangerous bypass: {}\n\n\
+             - Dangerous bypass: {}\n\
+             - Live progress: {}\n\n\
              ## Layout\n\n\
              - PROCESS_LOG.md: orchestrator-level timeline and statuses.\n\
              - PROMPT_TEMPLATE.md: fixed research contract.\n\
@@ -50,6 +56,7 @@ pub(super) fn initialize_output_files(
             run_options.model.unwrap_or("config/default"),
             sandbox_name(run_options.sandbox),
             run_options.dangerous_bypass,
+            run_options.show_progress,
         ),
     )?;
     write_if_missing(&output_dir.join("PROMPT_TEMPLATE.md"), PROMPT_TEMPLATE)?;
@@ -241,8 +248,11 @@ pub(super) fn build_child_args(
     args.push(OsString::from("--skip-git-repo-check"));
     args.push(OsString::from("--ephemeral"));
     args.push(OsString::from("--json"));
+    // Keep the agent's writable workspace rooted at the candidate directory.
+    // The Linux source tree is intentionally only an explicit read target in
+    // the prompt, so workspace-write cannot modify it accidentally.
     args.push(OsString::from("--cd"));
-    args.push(run_options.linux_path.as_os_str().to_os_string());
+    args.push(candidate_dir.as_os_str().to_os_string());
     args.push(OsString::from("--add-dir"));
     args.push(run_options.output_dir.as_os_str().to_os_string());
     args.push(OsString::from("--add-dir"));
@@ -275,15 +285,16 @@ fn toml_quote(value: &str) -> String {
 pub(super) async fn run_agent(
     executable: &Path,
     args: &[OsString],
-    linux_path: &Path,
+    working_dir: &Path,
     candidate_dir: &Path,
     api_key: Option<&OsStr>,
     prompt: &str,
+    show_progress: bool,
 ) -> Result<ExitStatus> {
     let mut command = Command::new(executable);
     command
         .args(args)
-        .current_dir(linux_path)
+        .current_dir(working_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -302,15 +313,251 @@ pub(super) async fn run_agent(
         .context("writing the research prompt to the child")?;
     drop(stdin);
 
-    let output = child
-        .wait_with_output()
-        .await
-        .context("waiting for the child Codex session")?;
-    fs::write(candidate_dir.join("agent-events.jsonl"), output.stdout)
+    let stdout = child.stdout.take().context("child stdout was not piped")?;
+    let stderr = child.stderr.take().context("child stderr was not piped")?;
+    let stdout_task = collect_child_stream(stdout, show_progress, false);
+    let stderr_task = collect_child_stream(stderr, show_progress, true);
+    let (stdout, stderr, status) = tokio::join!(stdout_task, stderr_task, child.wait());
+    let stdout = stdout.context("reading child Codex events")?;
+    let stderr = stderr.context("reading child Codex stderr")?;
+    let status = status.context("waiting for the child Codex session")?;
+
+    fs::write(candidate_dir.join("agent-events.jsonl"), stdout)
         .with_context(|| format!("writing events in {}", candidate_dir.display()))?;
-    fs::write(candidate_dir.join("agent-stderr.log"), output.stderr)
+    fs::write(candidate_dir.join("agent-stderr.log"), stderr)
         .with_context(|| format!("writing stderr in {}", candidate_dir.display()))?;
-    Ok(output.status)
+    Ok(status)
+}
+
+async fn collect_child_stream<R>(stream: R, show_progress: bool, is_stderr: bool) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    let mut collected = Vec::new();
+    let mut line = Vec::new();
+    let mut renderer = LiveProgressRenderer::default();
+
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .await
+            .context("reading a child output line")?;
+        if bytes_read == 0 {
+            break;
+        }
+        collected.extend_from_slice(&line);
+        if show_progress {
+            if is_stderr {
+                render_child_stderr(&line);
+            } else {
+                renderer.render_json_line(&line);
+            }
+        }
+    }
+
+    Ok(collected)
+}
+
+#[derive(Default)]
+pub(super) struct LiveProgressRenderer {
+    pub(super) command_output: HashMap<String, String>,
+}
+
+impl LiveProgressRenderer {
+    pub(super) fn render_json_line(&mut self, line: &[u8]) {
+        let Ok(event) = serde_json::from_slice::<Value>(line) else {
+            let text = String::from_utf8_lossy(line);
+            print_live(&format!("[codex] {}", text.trim_end()));
+            return;
+        };
+
+        match event.get("type").and_then(Value::as_str) {
+            Some("thread.started") => {
+                if let Some(thread_id) = event.get("thread_id").and_then(Value::as_str) {
+                    print_live(&format!("• thread started: {thread_id}"));
+                }
+            }
+            Some("turn.started") => print_live("• turn started; agent is working"),
+            Some("item.started") => {
+                if let Some(item) = event.get("item") {
+                    self.render_item_started(item);
+                }
+            }
+            Some("item.updated") => {
+                if let Some(item) = event.get("item") {
+                    self.render_item_updated(item);
+                }
+            }
+            Some("item.completed") => {
+                if let Some(item) = event.get("item") {
+                    self.render_item_completed(item);
+                }
+            }
+            Some("turn.completed") => {
+                let usage = event.get("usage");
+                let input = usage
+                    .and_then(|value| value.get("input_tokens"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let output = usage
+                    .and_then(|value| value.get("output_tokens"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                print_live(&format!(
+                    "• turn completed (input: {input}, output: {output})"
+                ));
+            }
+            Some("turn.failed") => {
+                let message = event
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown turn failure");
+                print_live(&format!("✗ turn failed: {message}"));
+            }
+            Some("error") => {
+                let message = event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown Codex error");
+                print_live(&format!("✗ codex error: {message}"));
+            }
+            Some(event_type) => print_live(&format!("• codex event: {event_type}")),
+            None => print_live("• codex event without a type"),
+        }
+    }
+
+    fn render_item_started(&mut self, item: &Value) {
+        match item.get("type").and_then(Value::as_str) {
+            Some("command_execution") => {
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<command>");
+                print_live(&format!("\nexec\n{command}"));
+            }
+            Some("mcp_tool_call") => {
+                let server = item.get("server").and_then(Value::as_str).unwrap_or("?");
+                let tool = item.get("tool").and_then(Value::as_str).unwrap_or("?");
+                print_live(&format!("mcp: {server}/{tool} started"));
+            }
+            Some("web_search") => {
+                let query = item.get("query").and_then(Value::as_str).unwrap_or("?");
+                print_live(&format!("web search: {query}"));
+            }
+            Some("file_change") => print_live("apply patch"),
+            Some("todo_list") => print_live("plan started"),
+            Some(item_type) => print_live(&format!("item started: {item_type}")),
+            None => {}
+        }
+    }
+
+    fn render_item_updated(&mut self, item: &Value) {
+        if item.get("type").and_then(Value::as_str) == Some("command_execution") {
+            self.render_command_output(item);
+        }
+    }
+
+    fn render_item_completed(&mut self, item: &Value) {
+        match item.get("type").and_then(Value::as_str) {
+            Some("agent_message") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    print_live(&format!("\ncodex\n{text}"));
+                }
+            }
+            Some("reasoning") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    print_live(text);
+                }
+            }
+            Some("command_execution") => {
+                let status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                let suffix = item
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .map(|code| format!(" (exit {code})"))
+                    .unwrap_or_default();
+                print_live(&format!("{status}{suffix}:"));
+                self.render_command_output(item);
+            }
+            Some("file_change") => {
+                let status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                print_live(&format!("patch: {status}"));
+                if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+                    for change in changes {
+                        if let Some(path) = change.get("path").and_then(Value::as_str) {
+                            print_live(path);
+                        }
+                    }
+                }
+            }
+            Some("mcp_tool_call") => {
+                let server = item.get("server").and_then(Value::as_str).unwrap_or("?");
+                let tool = item.get("tool").and_then(Value::as_str).unwrap_or("?");
+                let status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                print_live(&format!("mcp: {server}/{tool} ({status})"));
+                if let Some(error) = item
+                    .get("error")
+                    .and_then(|value| value.get("message"))
+                    .and_then(Value::as_str)
+                {
+                    print_live(&format!("[mcp error] {error}"));
+                }
+            }
+            Some("todo_list") => print_live("plan updated"),
+            Some("error") => {
+                if let Some(message) = item.get("message").and_then(Value::as_str) {
+                    print_live(&format!("✗ {message}"));
+                }
+            }
+            Some(item_type) => print_live(&format!("item completed: {item_type}")),
+            None => {}
+        }
+    }
+
+    fn render_command_output(&mut self, item: &Value) {
+        let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let output = item
+            .get("aggregated_output")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let previous = self
+            .command_output
+            .insert(item_id.to_string(), output.to_string())
+            .unwrap_or_default();
+        let delta = output.strip_prefix(&previous).unwrap_or(output).trim_end();
+        if !delta.is_empty() {
+            print_live(delta);
+        }
+    }
+}
+
+fn render_child_stderr(line: &[u8]) {
+    let text = String::from_utf8_lossy(line).trim_end().to_string();
+    if !text.is_empty() {
+        print_live(&format!("[codex] {text}"));
+    }
+}
+
+fn print_live(text: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{text}");
+    let _ = stderr.flush();
 }
 
 pub(super) fn format_command_for_file(executable: &Path, args: &[OsString]) -> String {

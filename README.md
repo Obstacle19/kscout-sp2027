@@ -99,11 +99,119 @@ export OPENAI_API_KEY='your-api-key'
 /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
   --linux-path /root/workspace/linux \
   --output-dir /root/workspace/linux-vuln-set \
-  --count 1
+  --count 1 \
+  --show-progress
+```
+
+如果使用 DeepSeek API，而 key 位于 `DEEPSEEK_API_KEY`，请这样运行：
+
+```shell
+export DEEPSEEK_API_KEY='your-deepseek-api-key'
+
+/root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
+  --api-key-env DEEPSEEK_API_KEY \
+  --api-base-url https://api.deepseek.com \
+  --model deepseek-flash \
+  --disable code_mode_host \
+  --linux-path /root/workspace/linux \
+  --output-dir /root/workspace/linux-vuln-set \
+  --count 1 \
+  --show-progress
+```
+
+如果 key 是在 zsh 登录配置中设置的，也可以用下面的命令启动。`zsh -lic` 会加载
+登录 shell 的环境变量，`exec` 会让 Codex CLI 直接成为该 shell 的前台进程：
+
+```shell
+zsh -lic 'exec /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
+  --api-key-env DEEPSEEK_API_KEY \
+  --api-base-url https://api.deepseek.com \
+  --model deepseek-flash \
+  --disable code_mode_host \
+  --linux-path /root/workspace/linux \
+  --output-dir /root/workspace/linux-vuln-set \
+  --count 1 \
+  --show-progress \
+  --stop-on-error'
+```
+
+运行前可以只检查 key 是否存在，不会打印 key 内容：
+
+```shell
+zsh -lic 'if [[ -n "$DEEPSEEK_API_KEY" ]]; then
+  echo "DEEPSEEK_API_KEY is set"
+else
+  echo "DEEPSEEK_API_KEY is not set" >&2
+  exit 1
+fi'
 ```
 
 这里省略 `--model` 表示继承 `~/.codex/config.toml` 中的 `model`。如果需要
 覆盖模型，再添加 `--model <实际模型名>`；`your-model` 只是占位符，不能原样输入。
+`--show-progress`（也可以写成 `--verbose`）会把子进程的思考摘要、命令、命令输出
+和最终消息实时转发到终端；不加该参数时只在结束后保存日志。
+默认沙箱会把每个 `candidate-NNN` 作为可写工作区，以便保存 PoC 和证据，同时不把
+Linux 源码目录加入可写根。需要 QEMU 或挂载等特权操作时，只应在隔离实验环境中显式
+使用 `--dangerously-bypass-approvals-and-sandbox`。
+
+### 重复运行与实时观察
+
+上面的命令每次会自动化执行一次独立候选挖掘：读取 Linux 源码和提交历史，调用指定模型
+进行审计，尝试构建用户态 PoC，执行控制实验和 QEMU 验证，并把报告、日志和证据保存到
+输出目录。`--count 1` 表示本次只执行一个候选任务，并不保证一定能找到有效漏洞；结果也
+可能是 `negative`、`inconclusive`、构建失败或 API 失败。
+
+在同一个输出目录再次运行时，工具会跳过已经存在的 `candidate-NNN`，并分配下一个目录，
+例如继续生成 `candidate-008`。如果希望完全独立地保存一轮实验，使用新的输出目录：
+
+```shell
+zsh -lic 'exec /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
+  --api-key-env DEEPSEEK_API_KEY \
+  --api-base-url https://api.deepseek.com \
+  --model deepseek-flash \
+  --disable code_mode_host \
+  --linux-path /root/workspace/linux \
+  --output-dir /root/workspace/linux-vuln-set-run-002 \
+  --count 1 \
+  --show-progress \
+  --stop-on-error'
+```
+
+`--show-progress` 开启后，终端会显示类似普通 Codex 会话的线程、工具调用、命令输出、
+重连和最终消息。按 `Ctrl-C` 会中断当前运行；已经写入磁盘的日志和证据通常仍会保留。
+如果只想后台观察已写入的日志，可以使用：
+
+```shell
+tail -f /root/workspace/linux-vuln-set/PROCESS_LOG.md
+tail -f /root/workspace/linux-vuln-set/candidates/candidate-007/agent-stderr.log
+```
+
+### 结果检查命令
+
+进程正常退出不等于已经发现漏洞。应同时检查最终报告、过程日志、PoC 和 oracle 证据：
+
+```shell
+less /root/workspace/linux-vuln-set/PROCESS_LOG.md
+less /root/workspace/linux-vuln-set/candidates/candidate-007/agent-final.md
+less /root/workspace/linux-vuln-set/candidates/candidate-007/report.md
+less /root/workspace/linux-vuln-set/candidates/candidate-007/REPRODUCE.md
+find /root/workspace/linux-vuln-set/candidates/candidate-007 -maxdepth 2 -type f | sort
+rg -n 'ATTACK_RESULT|ESCAPED|confined|inconclusive|negative|ERROR' \
+  /root/workspace/linux-vuln-set/candidates/candidate-007
+```
+
+确认漏洞时，重点核对报告中的用户态入口、稳定 oracle、控制实验、重复运行结果和现实
+影响评估；不能只根据模型的最终一句话或 CLI 的退出码判断。
+
+### 修改平台代码后重新构建
+
+如果修改了 `/root/workspace/codex` 中的 Rust 源码，需要重新构建后再运行；仅修改 Linux
+源码时不需要重新构建 Codex：
+
+```shell
+cd /root/workspace/codex/codex-rs
+cargo build --locked -p codex-cli --bin codex
+```
 
 使用 `--count 3` 可以运行 3 个相互独立的候选挖掘任务。使用以下命令查看结果：
 
