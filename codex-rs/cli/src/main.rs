@@ -64,6 +64,7 @@ mod exec_server_args_tests;
 mod exec_server_auth;
 mod exec_server_command;
 mod exec_server_telemetry;
+mod kernel_vuln;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod mcp_login;
@@ -78,6 +79,7 @@ mod state_db_recovery;
 mod wsl_paths;
 
 use crate::exec_server_command::ExecServerCommand;
+use crate::kernel_vuln::KernelVulnCommand;
 use crate::mcp_cmd::McpCli;
 use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
@@ -150,6 +152,10 @@ enum Subcommand {
     /// Run Codex non-interactively.
     #[clap(visible_alias = "e")]
     Exec(ExecCli),
+
+    /// Run deterministic, userland-oracle Linux kernel vulnerability research.
+    #[clap(visible_alias = "vuln-hunt")]
+    KernelVuln(KernelVulnCommand),
 
     /// Run a code review non-interactively.
     Review(ReviewCommand),
@@ -1146,6 +1152,14 @@ async fn cli_main(
                 root_config_overrides.clone(),
             );
             codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
+        }
+        Some(Subcommand::KernelVuln(kernel_vuln_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "kernel-vuln",
+            )?;
+            kernel_vuln::run(kernel_vuln_cli, &root_config_overrides, arg0_paths.clone()).await?;
         }
         Some(Subcommand::Review(ReviewCommand {
             strict_config,
@@ -2232,6 +2246,7 @@ fn unsupported_subcommand_name_for_strict_config(
         None
         | Some(Subcommand::Agents(_))
         | Some(Subcommand::Exec(_))
+        | Some(Subcommand::KernelVuln(_))
         | Some(Subcommand::Review(_))
         | Some(Subcommand::ExecServer(_))
         | Some(Subcommand::Resume(_))

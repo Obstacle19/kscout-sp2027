@@ -71,11 +71,56 @@ Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your 
 
 You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
 
+### Linux 内核漏洞挖掘模式
+
+本分支提供 `codex kernel-vuln`，用于进行确定性 Linux 内核漏洞挖掘。首先构建 CLI：
+
+```shell
+cd /root/workspace/codex/codex-rs
+cargo build -p codex-cli --bin codex
+```
+
+先执行 dry-run，生成 prompt 和输出目录结构，但不会调用模型：
+
+```shell
+/root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
+  --linux-path /root/workspace/linux \
+  --output-dir /root/workspace/linux-vuln-set \
+  --count 1 \
+  --model test-model \
+  --dry-run
+```
+
+通过环境变量设置 API key，然后开始实际挖掘。API key 不会出现在命令行参数或过程日志中：
+
+```shell
+export OPENAI_API_KEY='your-api-key'
+
+/root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
+  --linux-path /root/workspace/linux \
+  --output-dir /root/workspace/linux-vuln-set \
+  --count 1
+```
+
+这里省略 `--model` 表示继承 `~/.codex/config.toml` 中的 `model`。如果需要
+覆盖模型，再添加 `--model <实际模型名>`；`your-model` 只是占位符，不能原样输入。
+
+使用 `--count 3` 可以运行 3 个相互独立的候选挖掘任务。使用以下命令查看结果：
+
+```shell
+less /root/workspace/linux-vuln-set/PROCESS_LOG.md
+less /root/workspace/linux-vuln-set/candidates/candidate-001/agent-final.md
+find /root/workspace/linux-vuln-set/candidates/candidate-001 -maxdepth 2 -type f
+```
+
+每个候选目录都会保存完整 prompt、执行命令、原始 JSONL/stderr 日志、最终报告、PoC、证据和复现指南。关于自定义 API 地址、沙箱选项、focus/commit 筛选和输出目录结构，请参阅[完整操作指南](./KERNEL_VULN_HUNT.md)。
+
 ## Docs
 
 - [**Codex Documentation**](https://developers.openai.com/codex)
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
+- [**Linux 内核漏洞挖掘模式**](./KERNEL_VULN_HUNT.md)
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
