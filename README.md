@@ -162,7 +162,14 @@ Linux 源码目录加入可写根。需要 QEMU 或挂载等特权操作时，�
 可能是 `negative`、`inconclusive`、构建失败或 API 失败。
 
 在同一个输出目录再次运行时，工具会跳过已经存在的 `candidate-NNN`，并分配下一个目录，
-例如继续生成 `candidate-008`。如果希望完全独立地保存一轮实验，使用新的输出目录：
+例如继续生成 `candidate-008`。每轮结束后，工具会从已有候选的
+`finding-fingerprint.md`（旧结果则读取 `agent-final.md` 或 `report.md`）重建
+`FINDING_INDEX.md`，并要求后续模型只把它用于排除相同根因。每轮也会保存自己的
+`finding-fingerprint.md`，记录子系统、代码位置、根因、触发路径和 oracle。该机制依赖模型
+比较语义，能降低重复概率，但不能保证绝对零重复；应复核新报告和索引。使用新的输出目录
+会从空索引开始，不能沿用旧目录的排除记录。
+
+如果希望完全独立地保存一轮实验，使用新的输出目录：
 
 ```shell
 zsh -lic 'exec /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \

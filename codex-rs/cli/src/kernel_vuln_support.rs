@@ -46,6 +46,7 @@ pub(super) fn initialize_output_files(
              - Live progress: {}\n\n\
              ## Layout\n\n\
              - PROCESS_LOG.md: orchestrator-level timeline and statuses.\n\
+             - FINDING_INDEX.md: prior candidate fingerprints used to exclude duplicate findings.\n\
              - PROMPT_TEMPLATE.md: fixed research contract.\n\
              - source-status-before.txt and source-status-after.txt: source-tree checks.\n\
              - candidates/candidate-NNN/: one isolated agent pass and its evidence.\n",
@@ -188,12 +189,14 @@ pub(super) fn render_prompt(
 ) -> String {
     let focus = focus.unwrap_or("no extra focus; choose the strongest candidate autonomously");
     let commit = commit.unwrap_or("current HEAD and relevant local upstream history");
+    let finding_index = output_dir.join("FINDING_INDEX.md");
     format!(
         "{PROMPT_TEMPLATE}\n\n\
          Runtime paths for this pass:\n\n\
          - Linux source: {linux_path}\n\
          - Overall output directory: {output_dir}\n\
          - Candidate directory: {candidate_dir}\n\
+         - Duplicate exclusion index: {finding_index}\n\
          - Audit focus: {focus}\n\
          - First commit or revision to inspect: {commit}\n\n\
          Execution rules for this pass:\n\n\
@@ -206,6 +209,7 @@ pub(super) fn render_prompt(
         linux_path = linux_path.display(),
         output_dir = output_dir.display(),
         candidate_dir = candidate_dir.display(),
+        finding_index = finding_index.display(),
     )
 }
 

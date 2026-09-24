@@ -18,9 +18,12 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[path = "kernel_vuln_dedup.rs"]
+mod kernel_vuln_dedup;
 #[path = "kernel_vuln_support.rs"]
 mod kernel_vuln_support;
 
+use self::kernel_vuln_dedup::refresh_finding_index;
 use self::kernel_vuln_support::allocate_candidate_directory;
 use self::kernel_vuln_support::append_log;
 use self::kernel_vuln_support::build_child_args;
@@ -41,6 +44,7 @@ const CUSTOM_PROVIDER_ID: &str = "linux_vuln_provider";
 const DEFAULT_LINUX_PATH: &str = "/root/workspace/linux";
 const DEFAULT_OUTPUT_DIR: &str = "./linux-vuln-set";
 const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
+const FINDING_INDEX_FILE_NAME: &str = "FINDING_INDEX.md";
 
 const PROMPT_TEMPLATE: &str = r#"# Linux kernel vulnerability research contract
 
@@ -77,6 +81,11 @@ Required constraints:
 Discovery discipline:
 
 - Start from code and commit history in the supplied tree.
+- Before selecting a lead, read the tool-managed FINDING_INDEX.md at the
+  overall output directory. Use its prior candidate summaries only to exclude
+  duplicate root causes; do not use them as discovery evidence or copy their
+  PoCs. If a lead matches a prior finding's root cause, invariant, trigger,
+  affected code, and oracle, reject it and continue with a different issue.
 - Do not mine unrelated pre-existing research directories, prior PoCs, review
   records, or external finding databases for a candidate. If such artifacts are
   visible in the environment, treat them as contaminated leads that may only be
@@ -95,6 +104,10 @@ Discovery discipline:
 Deliverables in the candidate directory:
 
 - a candidate report with root cause and source references;
+- a concise finding-fingerprint.md with outcome, title, subsystem,
+  affected files/functions, root cause/invariant, user-controlled trigger,
+  observable oracle, affected revision, and duplicate-of (or none). For a
+  negative or inconclusive pass, state that outcome and the scope checked;
 - a userland-only PoC source and built artifact when practical;
 - an exact reproduction and operation guide;
 - raw command output and relevant kernel or userspace logs;
@@ -226,6 +239,7 @@ pub(crate) async fn run(
     let candidates_dir = output_dir.join("candidates");
     fs::create_dir_all(&candidates_dir)
         .with_context(|| format!("creating {}", candidates_dir.display()))?;
+    let finding_index = output_dir.join(FINDING_INDEX_FILE_NAME);
 
     let executable = arg0_paths
         .codex_self_exe
@@ -258,6 +272,7 @@ pub(crate) async fn run(
         show_progress,
     };
     initialize_output_files(&run_options, &process_log)?;
+    refresh_finding_index(&candidates_dir, &finding_index)?;
 
     let started_at = Utc::now().to_rfc3339();
     append_log(
@@ -272,6 +287,7 @@ pub(crate) async fn run(
              - Model: {}\n\
              - Focus: {}\n\
              - Commit scope: {}\n\
+             - Duplicate exclusion index: {}\n\
              - Sandbox: {}\n\
              - Dangerous bypass: {dangerously_bypass_approvals_and_sandbox}\n\
              - Live progress: {show_progress}\n\
@@ -282,6 +298,7 @@ pub(crate) async fn run(
             model.as_deref().unwrap_or("config/default"),
             focus.as_deref().unwrap_or("none"),
             commit.as_deref().unwrap_or("current tree/history"),
+            finding_index.display(),
             sandbox_name(sandbox),
         ),
     )?;
@@ -383,6 +400,7 @@ pub(crate) async fn run(
             show_progress,
         )
         .await;
+        refresh_finding_index(&candidates_dir, &finding_index)?;
 
         match result {
             Ok(status) if status.success() => {

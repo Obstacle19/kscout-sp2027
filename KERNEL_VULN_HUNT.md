@@ -120,12 +120,14 @@ api-base-url 必须兼容 OpenAI Responses API。若没有外部 API key 但希�
 linux-vuln-set/
 ├── README.md
 ├── PROMPT_TEMPLATE.md
+├── FINDING_INDEX.md
 ├── PROCESS_LOG.md
 ├── source-status-before.txt
 ├── source-status-after.txt
 └── candidates/
     ├── candidate-001/
     │   ├── prompt.md
+    │   ├── finding-fingerprint.md
     │   ├── command.txt
     │   ├── run-metadata.md
     │   ├── agent-events.jsonl
@@ -137,7 +139,13 @@ linux-vuln-set/
 
 PROCESS_LOG.md 记录编排器的启动参数、每个候选的开始和结束状态、失败信息以及源码前后状态。每个 candidate-NNN 目录下的 prompt.md 是该轮实际发送给模型的完整提示词，agent-events.jsonl 和 agent-stderr.log 是原始运行日志。
 
-如果 output-dir 已经存在，工具会跳过已存在的 candidate-NNN 目录，不覆盖旧证据。
+如果 output-dir 已经存在，工具会跳过已存在的 candidate-NNN 目录，不覆盖旧证据。每轮
+运行会从现有 candidate 的 finding-fingerprint.md 重建 FINDING_INDEX.md；旧 candidate
+没有该文件时，会读取 agent-final.md 或 report.md。后续候选会将索引用于排除相同根因，
+并在自己的目录里写 finding-fingerprint.md，供同一 output-dir 后续运行使用。
+
+去重依赖模型比较根因、触发路径和 oracle，不能保证语义上的绝对零重复。若改用新的
+output-dir，索引从空目录开始，不包含旧目录的排除记录。
 
 ## 研究约束
 
@@ -151,7 +159,8 @@ PROCESS_LOG.md 记录编排器的启动参数、每个候选的开始和结束�
 6. 找不到稳定候选时必须报告 negative 或 inconclusive，而不是编造漏洞。
 
 子代理不会把 output-dir 之外的既有研究目录、旧 PoC、审查记录或外部漏洞数据库作为
-发现证据；如果这些材料可见，只能用来排除候选，不能复制或改写成新结果。
+发现证据；如果这些材料可见，只能用来排除候选，不能复制或改写成新结果。FINDING_INDEX.md
+只用于检查同一 output-dir 中已经处理过的候选是否重复，不可用作发现证据。
 
 默认 workspace-write 沙箱把 candidate-NNN 作为子代理工作目录，并把 output-dir 和
 candidate-NNN 作为可写证据目录；Linux 源码目录只作为显式读取目标，不加入可写根，
