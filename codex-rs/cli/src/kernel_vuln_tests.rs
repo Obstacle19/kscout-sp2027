@@ -95,3 +95,39 @@ fn prompt_contains_each_runtime_output_path() {
     assert!(prompt.contains("fs/ntfs3"));
     assert!(prompt.contains("deadbeef"));
 }
+
+#[test]
+fn cve_rules_are_disabled_by_default_and_enabled_only_by_flag() {
+    let default_command = KernelVulnCommand::try_parse_from(["kernel-vuln"])
+        .expect("default kernel-vuln command should parse");
+    assert!(!default_command.use_cve_rules);
+    assert!(!default_command.rule_mode_enabled());
+
+    let rule_command = KernelVulnCommand::try_parse_from(["kernel-vuln", "--use-cve-rules"])
+        .expect("CVE-rule option should parse");
+    assert!(rule_command.use_cve_rules);
+    assert!(rule_command.rule_mode_enabled());
+
+    let selected_rules = KernelVulnCommand::try_parse_from([
+        "kernel-vuln",
+        "--cve-rule",
+        "CVE-2025-38193",
+        "--cve-rule",
+        "CVE-2023-52640",
+    ])
+    .expect("repeated CVE-rule selectors should parse");
+    assert!(!selected_rules.use_cve_rules);
+    assert!(selected_rules.rule_mode_enabled());
+    assert_eq!(
+        selected_rules.cve_rules,
+        ["CVE-2025-38193".to_string(), "CVE-2023-52640".to_string()]
+    );
+}
+
+#[test]
+fn cve_rule_mode_uses_the_count_as_a_total_review_budget() {
+    assert_eq!(scheduled_pass_counts(3, 7, true), (3, 3));
+    assert_eq!(scheduled_pass_counts(3, 1, true), (1, 1));
+    assert_eq!(scheduled_pass_counts(3, 0, true), (0, 0));
+    assert_eq!(scheduled_pass_counts(3, 7, false), (3, 0));
+}

@@ -63,6 +63,7 @@ pub struct EventProcessorWithJsonOutput {
     raw_to_exec_item_id: HashMap<String, String>,
     running_todo_list: Option<RunningTodoList>,
     last_total_token_usage: Option<ThreadTokenUsage>,
+    last_total_token_usage_turn_id: Option<String>,
     last_critical_error: Option<ThreadErrorEvent>,
     final_message: Option<String>,
     emit_final_message_on_shutdown: bool,
@@ -88,6 +89,7 @@ impl EventProcessorWithJsonOutput {
             raw_to_exec_item_id: HashMap::new(),
             running_todo_list: None,
             last_total_token_usage: None,
+            last_total_token_usage_turn_id: None,
             last_critical_error: None,
             final_message: None,
             emit_final_message_on_shutdown: false,
@@ -117,16 +119,22 @@ impl EventProcessorWithJsonOutput {
         let _ = std::io::stdout().flush();
     }
 
-    fn usage_from_last_total(&self) -> Usage {
-        let Some(usage) = self.last_total_token_usage.as_ref() else {
+    fn usage_from_last_total(&self, turn_id: &str) -> Usage {
+        let Some(usage) = self
+            .last_total_token_usage
+            .as_ref()
+            .filter(|_| self.last_total_token_usage_turn_id.as_deref() == Some(turn_id))
+        else {
             return Usage::default();
         };
         Usage {
+            usage_reported: true,
             input_tokens: usage.total.input_tokens,
             cached_input_tokens: usage.total.cached_input_tokens,
             cache_write_input_tokens: usage.total.cache_write_input_tokens,
             output_tokens: usage.total.output_tokens,
             reasoning_output_tokens: usage.total.reasoning_output_tokens,
+            total_tokens: usage.total.total_tokens,
         }
     }
 
@@ -509,6 +517,7 @@ impl EventProcessorWithJsonOutput {
             }
             ServerNotification::ModelVerification(_) => CodexStatus::Running,
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
+                self.last_total_token_usage_turn_id = Some(notification.turn_id);
                 self.last_total_token_usage = Some(notification.token_usage);
                 CodexStatus::Running
             }
@@ -533,7 +542,7 @@ impl EventProcessorWithJsonOutput {
                         }
                         self.emit_final_message_on_shutdown = true;
                         events.push(ThreadEvent::TurnCompleted(TurnCompletedEvent {
-                            usage: self.usage_from_last_total(),
+                            usage: self.usage_from_last_total(&notification.turn.id),
                         }));
                         CodexStatus::InitiateShutdown
                     }

@@ -56,20 +56,26 @@ pub struct TurnFailedEvent {
     pub error: ThreadErrorEvent,
 }
 
-/// Describes the usage of tokens during a turn.
+/// Cumulative thread token usage exposed when a turn completes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS, Default)]
 pub struct Usage {
-    /// The number of input tokens used during the turn.
+    /// Whether the CLI observed token usage for the completed turn.
+    #[serde(default)]
+    pub usage_reported: bool,
+    /// The cumulative number of input tokens used by the thread so far.
     pub input_tokens: i64,
-    /// The number of cached input tokens used during the turn.
+    /// The cumulative number of cached input tokens used by the thread so far.
     pub cached_input_tokens: i64,
-    /// The number of input tokens written to the prompt cache during the turn.
+    /// The cumulative number of input tokens written to the prompt cache.
     #[serde(default)]
     pub cache_write_input_tokens: i64,
-    /// The number of output tokens used during the turn.
+    /// The cumulative number of output tokens used by the thread so far.
     pub output_tokens: i64,
-    /// The number of reasoning output tokens used during the turn.
+    /// The cumulative number of reasoning output tokens used by the thread so far.
     pub reasoning_output_tokens: i64,
+    /// The cumulative number of tokens used by the thread so far.
+    #[serde(default)]
+    pub total_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]

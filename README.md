@@ -1,86 +1,28 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+# Linux 内核漏洞挖掘平台
 
----
+本仓库是面向 Linux 内核源码与提交历史的专用漏洞挖掘平台。平台基于 Codex CLI 的 agent、模型调用和执行能力构建，主要入口是 `codex kernel-vuln`。
 
-## Quickstart
+## 平台工作流
 
-### Installing and running Codex CLI
+- 扫描指定 Linux 源码树，确定性枚举安全相关代码候选；源码树作为审计输入，候选运行材料保存在单独的输出目录。
+- 使用可选的 CVE 派生规则，从经过核实的历史修复中提取漏洞成因、危险条件和安全不变量。规则模式默认关闭，可按子系统或 CVE 选择。
+- 将相关位置按规则家族合并，交给 agent 做语义审查，并复用已核实的追踪与控制结果。
+- 按研究流程尝试 PoC、控制实验和 QEMU 验证，并保存报告、日志和证据。每个结果都需要结合复现证据人工核查；扫描命中本身不代表已确认漏洞。
 
-Run the following on Mac or Linux to install Codex CLI:
+当前规则库包含 20 条 2022—2026 年高严重性 Linux 内核 CVE 派生规则，按主 CWE 分类。规则说明、命令参数及验证边界见[操作指南](docs/kernel-vuln-hunt.md)，按 CWE 浏览见[CVE/CWE 索引](docs/kernel-cve-cwe-index.md)，机器可读记录见 [KERNEL_CVE_KNOWLEDGE.json](KERNEL_CVE_KNOWLEDGE.json)。
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
+## 快速开始
 
-Run the following on Windows to install Codex CLI:
-
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
-
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
-
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
-```
-
-```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
-```
-
-Codex CLI can also be installed via the following package managers:
-
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
-
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
-
-Then simply run `codex` to get started.
-
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
-
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
-
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
-
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
-
-</details>
-
-### Using Codex with your ChatGPT plan
-
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
-
-### Linux 内核漏洞挖掘模式
-
-本分支提供 `codex kernel-vuln`，用于进行确定性 Linux 内核漏洞挖掘。首先构建 CLI：
+### 构建 CLI
 
 ```shell
 cd /root/workspace/codex/codex-rs
 cargo build -p codex-cli --bin codex
 ```
 
-先执行 dry-run，生成 prompt 和输出目录结构，但不会调用模型：
+### 先执行 dry-run
+
+生成 prompt 和输出目录结构，但不会调用模型：
 
 ```shell
 /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
@@ -91,7 +33,9 @@ cargo build -p codex-cli --bin codex
   --dry-run
 ```
 
-通过环境变量设置 API key，然后开始实际挖掘。API key 不会出现在命令行参数或过程日志中：
+### 开始实际挖掘
+
+通过环境变量设置 API key。API key 不会出现在命令行参数或过程日志中：
 
 ```shell
 export OPENAI_API_KEY='your-api-key'
@@ -103,7 +47,9 @@ export OPENAI_API_KEY='your-api-key'
   --show-progress
 ```
 
-如果使用 DeepSeek API，而 key 位于 `DEEPSEEK_API_KEY`，请这样运行：
+### 使用 DeepSeek API
+
+如果 key 位于 `DEEPSEEK_API_KEY`，请这样运行：
 
 ```shell
 export DEEPSEEK_API_KEY='your-deepseek-api-key'
@@ -169,6 +115,22 @@ Linux 源码目录加入可写根。需要 QEMU 或挂载等特权操作时，�
 比较语义，能降低重复概率，但不能保证绝对零重复；应复核新报告和索引。使用新的输出目录
 会从空索引开始，不能沿用旧目录的排除记录。
 
+每个实际启动的候选会把运行时间、子进程结果、发现状态和可用 token usage 写入
+`candidates/candidate-NNN/usage.json`，并追加到根目录的 `USAGE.jsonl`。`PROCESS_LOG.md`
+记录每轮汇总。若 usage 未报告，token 字段会显示为不可用；若有 turn 用量缺失，记录会标为
+`partial`，token 值为最近一次已报告的累计值，可能不包含缺失 turn。原始 usage 也保存在
+`agent-events.jsonl` 中。`--dry-run`
+不会调用模型，因此不会生成 usage 记录。该功能只记录新版本实际运行的候选；旧候选的历史
+耗时无法追溯，不会自动补录。
+
+候选 token 数取自最后一个报告用量的 turn 事件中的线程累计值，不会把各 turn 的累计值重复相加。
+
+另有默认关闭的 `--use-cve-rules` CVE 派生规则模块。可用 `--focus net/sched` 只扫描该子系统中的活动规则，或用 `--cve-rule CVE-2022-0847` 精确选择一条规则；`--cve-rule` 会自动启用规则模式，也可以重复选择多个活动 CVE。当前 20 条知识库记录均有确定性扫描规则：规则从人工核实的修复中提炼漏洞条件、危险使用模式和安全不变量，再遍历对应源码范围中的 C 函数枚举候选。按主 CWE 整理的 [20 条 2022—2026 年高严重性内核 CVE 知识库](KERNEL_CVE_KNOWLEDGE.json)保存修复来源和规则验证状态；便于浏览的 [CWE/CVE 索引](docs/kernel-cve-cwe-index.md)按弱点类型汇总成因和修复不变量。严格安全过滤器只排除经过核实的精确安全形态；同一规则下相关命中合并成一个定向审查，
+并且每次只向模型提供对应活动规则家族的知识，未变化的验证路径和控制结果直接复用，避免重复追踪同一数据流。启用规则后，
+`--count` 是定向审查的总上限，开放式自主搜索不再并行追加；规则命中较少时只运行实际可审查
+的规则组。审查仍沿用现有 PoC、控制实验和证据流程。解析器和过滤器边界、CVE 来源以及扫描报告格式见
+[kernel-vuln-hunt.md](docs/kernel-vuln-hunt.md#可选的-cve-派生规则筛选)。
+
 如果希望完全独立地保存一轮实验，使用新的输出目录：
 
 ```shell
@@ -228,14 +190,15 @@ less /root/workspace/linux-vuln-set/candidates/candidate-001/agent-final.md
 find /root/workspace/linux-vuln-set/candidates/candidate-001 -maxdepth 2 -type f
 ```
 
-每个候选目录都会保存完整 prompt、执行命令、原始 JSONL/stderr 日志、最终报告、PoC、证据和复现指南。关于自定义 API 地址、沙箱选项、focus/commit 筛选和输出目录结构，请参阅[完整操作指南](./KERNEL_VULN_HUNT.md)。
+每个候选目录都会保存完整 prompt、执行命令、原始 JSONL/stderr 日志、最终报告、PoC、证据和复现指南。关于自定义 API 地址、沙箱选项、focus/commit 筛选和输出目录结构，请参阅[完整操作指南](./docs/kernel-vuln-hunt.md)。
 
-## Docs
+## 文档
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-- [**Linux 内核漏洞挖掘模式**](./KERNEL_VULN_HUNT.md)
+- [Linux 内核漏洞挖掘操作指南](./docs/kernel-vuln-hunt.md)
+- [按 CWE 整理的 CVE 规则索引](./docs/kernel-cve-cwe-index.md)
+- [结构化 CVE 规则知识库](./KERNEL_CVE_KNOWLEDGE.json)
+- [平台开发与贡献说明](./docs/contributing.md)
 
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+本平台基于 Codex CLI 运行时；底层配置和模型接入方式可参考 [Codex 文档](https://developers.openai.com/codex)。
+
+本仓库使用 [Apache-2.0 License](LICENSE)。

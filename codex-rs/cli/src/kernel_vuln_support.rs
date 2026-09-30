@@ -37,7 +37,7 @@ pub(super) fn initialize_output_files(
             "# Linux kernel vulnerability hunt output\n\n\
              This directory is managed by codex kernel-vuln.\n\n\
              - Linux source: {}\n\
-             - Requested candidates in this run: {}\n\
+             - Requested autonomous passes per run: {}\n\
              - API key variable: {} (value is never stored here)\n\
              - API base URL: {}\n\
              - Model: {}\n\
@@ -47,6 +47,8 @@ pub(super) fn initialize_output_files(
              ## Layout\n\n\
              - PROCESS_LOG.md: orchestrator-level timeline and statuses.\n\
              - FINDING_INDEX.md: prior candidate fingerprints used to exclude duplicate findings.\n\
+             - USAGE.jsonl: cumulative per-candidate elapsed time and token usage summaries.\n\
+             - rule-scan-*.md: optional deterministic CVE-derived candidate enumeration and filter report.\n\
              - PROMPT_TEMPLATE.md: fixed research contract.\n\
              - source-status-before.txt and source-status-after.txt: source-tree checks.\n\
              - candidates/candidate-NNN/: one isolated agent pass and its evidence.\n",
