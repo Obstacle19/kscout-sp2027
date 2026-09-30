@@ -190,7 +190,7 @@ less /root/workspace/linux-vuln-set/candidates/candidate-001/agent-final.md
 find /root/workspace/linux-vuln-set/candidates/candidate-001 -maxdepth 2 -type f
 ```
 
-每个候选目录都会保存完整 prompt、执行命令、原始 JSONL/stderr 日志、最终报告、PoC、证据和复现指南。关于自定义 API 地址、沙箱选项、focus/commit 筛选和输出目录结构，请参阅[完整操作指南](./docs/kernel-vuln-hunt.md)。
+每个候选目录都会保存完整 prompt、执行命令、原始 JSONL/stderr 日志、最终报告、PoC、证据和复现指南。可用 `--extra-prompt` 或 `--extra-prompt-file` 注入额外任务说明；提示词文件入口适合做规则关闭的知识提示对照，实际发送的完整内容会记录在候选 `prompt.md` 中。关于自定义 API 地址、沙箱选项、focus/commit 筛选和输出目录结构，请参阅[完整操作指南](./docs/kernel-vuln-hunt.md)。
 
 ## 文档
 

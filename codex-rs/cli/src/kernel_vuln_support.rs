@@ -13,6 +13,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::io::Write;
 use std::path::Component;
 use std::path::Path;
@@ -25,6 +26,44 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
+
+const MAX_CUSTOM_PROMPT_BYTES: usize = 8 * 1024;
+
+pub(super) fn load_custom_prompt(
+    inline_prompt: Option<String>,
+    prompt_file: Option<&Path>,
+) -> Result<Option<String>> {
+    let prompt = if let Some(prompt) = inline_prompt {
+        prompt
+    } else if let Some(prompt_file) = prompt_file {
+        let mut contents = Vec::new();
+        fs::File::open(prompt_file)
+            .with_context(|| format!("opening custom prompt {}", prompt_file.display()))?
+            .take((MAX_CUSTOM_PROMPT_BYTES + 1) as u64)
+            .read_to_end(&mut contents)
+            .with_context(|| format!("reading custom prompt {}", prompt_file.display()))?;
+        ensure!(
+            contents.len() <= MAX_CUSTOM_PROMPT_BYTES,
+            "custom prompt exceeds the {MAX_CUSTOM_PROMPT_BYTES}-byte limit"
+        );
+        String::from_utf8(contents).with_context(|| {
+            format!("custom prompt {} is not valid UTF-8", prompt_file.display())
+        })?
+    } else {
+        return Ok(None);
+    };
+
+    ensure!(
+        prompt.len() <= MAX_CUSTOM_PROMPT_BYTES,
+        "custom prompt exceeds the {MAX_CUSTOM_PROMPT_BYTES}-byte limit"
+    );
+    ensure!(!prompt.trim().is_empty(), "custom prompt cannot be empty");
+    ensure!(
+        !prompt.contains('\0'),
+        "custom prompt cannot contain NUL bytes"
+    );
+    Ok(Some(prompt))
+}
 
 pub(super) fn initialize_output_files(
     run_options: &RunOptions<'_>,

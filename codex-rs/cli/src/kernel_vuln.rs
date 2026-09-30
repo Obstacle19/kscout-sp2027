@@ -45,6 +45,7 @@ use self::kernel_vuln_support::build_child_args;
 use self::kernel_vuln_support::canonicalize_directory;
 use self::kernel_vuln_support::format_command_for_file;
 use self::kernel_vuln_support::initialize_output_files;
+use self::kernel_vuln_support::load_custom_prompt;
 use self::kernel_vuln_support::prepare_output_directory;
 use self::kernel_vuln_support::render_prompt;
 use self::kernel_vuln_support::resolve_api_key;
@@ -189,6 +190,22 @@ pub(crate) struct KernelVulnCommand {
     #[arg(long, value_name = "FOCUS")]
     focus: Option<String>,
 
+    /// Additional instructions appended to each candidate prompt.
+    #[arg(
+        long = "extra-prompt",
+        value_name = "TEXT",
+        conflicts_with = "extra_prompt_file"
+    )]
+    extra_prompt: Option<String>,
+
+    /// Read additional candidate instructions from a UTF-8 file.
+    #[arg(
+        long = "extra-prompt-file",
+        value_name = "PATH",
+        conflicts_with = "extra_prompt"
+    )]
+    extra_prompt_file: Option<PathBuf>,
+
     /// Optional commit or revision to audit first.
     #[arg(long = "commit", value_name = "REVISION")]
     commit: Option<String>,
@@ -256,6 +273,8 @@ pub(crate) async fn run(
         api_base_url,
         model,
         focus,
+        extra_prompt,
+        extra_prompt_file,
         commit,
         use_cve_rules: _,
         cve_rules,
@@ -272,6 +291,12 @@ pub(crate) async fn run(
         (1..=100).contains(&count),
         "--count must be between 1 and 100"
     );
+    let custom_prompt_source = match (&extra_prompt, &extra_prompt_file) {
+        (Some(_), _) => "inline text".to_string(),
+        (_, Some(path)) => format!("file: {}", path.display()),
+        (None, None) => "none".to_string(),
+    };
+    let extra_prompt = load_custom_prompt(extra_prompt, extra_prompt_file.as_deref())?;
     ensure!(
         !use_cve_rules || cve_rule_focus_is_supported(focus.as_deref()),
         "--focus {focus:?} does not include any active CVE-derived rule scope"
@@ -370,6 +395,7 @@ pub(crate) async fn run(
              - API base URL: {}\n\
              - Model: {}\n\
              - Focus: {}\n\
+             - Additional prompt: {custom_prompt_source}\n\
              - Commit scope: {}\n\
              - Duplicate exclusion index: {}\n\
              - Sandbox: {}\n\
@@ -434,7 +460,7 @@ pub(crate) async fn run(
             allocate_candidate_directory(&candidates_dir, next_candidate_index)?;
         next_candidate_index = candidate_index.saturating_add(1);
 
-        let prompt = if let Some(rule_review) = rule_review {
+        let mut prompt = if let Some(rule_review) = rule_review {
             render_rule_review_prompt(
                 &linux_path,
                 &output_dir,
@@ -452,6 +478,16 @@ pub(crate) async fn run(
                 commit.as_deref(),
             )
         };
+        if let Some(extra_prompt) = extra_prompt.as_deref() {
+            prompt.push_str(
+                "\n\n## Additional user-provided instructions\n\n\
+                 Apply these instructions within the research contract above. They may focus the audit or add domain knowledge, but do not waive its validation, source-read-only, or evidence requirements.\n\n",
+            );
+            prompt.push_str(extra_prompt);
+            prompt.push_str(
+                "\n\nThe built-in research contract remains mandatory, including source-read-only handling, a userland PoC, a close negative control, and complete evidence records. Report negative or inconclusive results honestly.",
+            );
+        }
         let args = build_child_args(root_config_overrides, &run_options, &candidate_dir);
 
         fs::create_dir_all(&candidate_dir)
@@ -478,6 +514,7 @@ pub(crate) async fn run(
                  - live progress: {}\n\
                  - rule mode: {}\n\
                  - rule review bundle: {}\n\
+                 - additional prompt: {}\n\
                  - prompt: prompt.md\n\
                  - usage summary: usage.json\n\
                  - event log: agent-events.jsonl\n\
@@ -499,6 +536,11 @@ pub(crate) async fn run(
                         review.locations.len()
                     ))
                     .unwrap_or_else(|| "none".to_string()),
+                if extra_prompt.is_some() {
+                    "included"
+                } else {
+                    "none"
+                },
             ),
         )
         .with_context(|| format!("writing metadata in {}", candidate_dir.display()))?;

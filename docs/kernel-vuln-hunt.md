@@ -105,6 +105,8 @@ api-base-url 必须兼容 OpenAI Responses API。若没有外部 API key 但希�
 - count：模型审查总上限，范围是 1 到 100。关闭规则时表示开放式自主搜索次数；启用规则时表示定向规则组审查次数。
 - `--use-cve-rules`：可选开关，默认关闭。启用后使用知识库定向审查代替开放式自主搜索；同一规则家族下的相关源码位置合并到一次审查中。
 - `--cve-rule CVE-ID`：只选择指定 CVE 派生的活动规则，并自动启用规则模式。可重复传入多个 CVE ID；未知 CVE 会报错。
+- `--extra-prompt TEXT`：把额外任务说明追加到每个候选的提示词中，适合简短、单行的临时指令；最多 8 KiB。
+- `--extra-prompt-file PATH`：从 UTF-8 文件读取额外任务说明，适合多行知识提示和可复现实验；最多 8 KiB。与 `--extra-prompt` 互斥。实际完整提示词保存在每个 `candidate-NNN/prompt.md` 中。
 - model：可选，传给每个子进程的模型名；省略时继承 `~/.codex/config.toml` 的 `model`。
 - focus：优先审计的子系统、目录或主题，例如 fs、net 或 fs/ntfs3。在规则模式下，它会按规则声明的子系统范围筛选规则；与 `--cve-rule` 同用时，两者必须匹配。
 - commit：优先检查的 commit 或 revision。
@@ -116,9 +118,31 @@ api-base-url 必须兼容 OpenAI Responses API。若没有外部 API key 但希�
 - dry-run：只生成 prompt 和执行命令，不调用模型。
 - stop-on-error：某一候选失败时立即停止后续候选。
 
+自定义提示词会追加到内置研究合同之后，可在规则模式和开放搜索模式中使用。做“知识提示、规则扫描关闭”的对照组时，不要启用 `--use-cve-rules` 或传入 `--cve-rule`，并通过 `--extra-prompt-file` 给所有重复轮次提供同一份提示词。例如：
+
+简短指令也可以直接写在命令行中：
+
+~~~sh
+/root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \\
+  --count 1 \\
+  --extra-prompt "优先审查 net/sched 中涉及整数边界的路径，并按内置要求完成 PoC、控制实验和证据记录。"
+~~~
+
+~~~sh
+/root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \\
+  --linux-path /root/workspace/linux \\
+  --output-dir /root/workspace/linux-vuln-prompt-only-01 \\
+  --count 1 \\
+  --extra-prompt-file /root/workspace/prompts/cwe-416-knowledge.md
+~~~
+
+知识提示适合写入可复用的漏洞成因、危险条件和安全不变量。为衡量提示词本身的效果，不要把规则扫描器给出的候选位置或已核实追踪结果复制进提示词；PoC、控制实验和证据要求由内置研究合同继续约束。
+
 ## 可选的 CVE 派生规则筛选
 
 `--use-cve-rules` 默认关闭。关闭时，`--count` 个子进程执行开放式自主搜索。启用时，`--count` 变成定向审查总预算：同一 CVE 根因家族下的多个源码命中合并为一个审查包，不再另起开放式搜索子进程。若安全过滤后只剩一个规则家族，即使 `--count 3` 也只启动一个模型审查；若没有可审查命中，则只生成扫描报告、不调用模型。规则模式的工作量随可复用成因数量增长，而不是随每个相似函数重复增长：
+
+规则知识如何从修复补丁进入运行时扫描、如何过滤和分组候选，以及模型如何复用核实结果，详见[知识库工作原理](kernel-cve-rule-knowledge.md)。
 
 ~~~sh
 /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
