@@ -77,6 +77,9 @@ pub(super) fn initialize_output_files(
              This directory is managed by codex kernel-vuln.\n\n\
              - Linux source: {}\n\
              - Requested autonomous passes per run: {}\n\
+             - Swarm audit groups: {}\n\
+             - Swarm agents per round: {}\n\
+             - Swarm argument rounds: {}\n\
              - API key variable: {} (value is never stored here)\n\
              - API base URL: {}\n\
              - Model: {}\n\
@@ -90,9 +93,12 @@ pub(super) fn initialize_output_files(
              - rule-scan-*.md: optional deterministic CVE-derived candidate enumeration and filter report.\n\
              - PROMPT_TEMPLATE.md: fixed research contract.\n\
              - source-status-before.txt and source-status-after.txt: source-tree checks.\n\
-             - candidates/candidate-NNN/: one isolated agent pass and its evidence.\n",
+             - candidates/candidate-NNN/: one isolated audit pass or peer swarm group with per-finding archives.\n",
             run_options.linux_path.display(),
             run_options.count,
+            run_options.swarm,
+            run_options.swarm_agents,
+            run_options.swarm_rounds,
             run_options.api_key_env,
             run_options.api_base_url.unwrap_or("default provider"),
             run_options.model.unwrap_or("config/default"),
@@ -241,7 +247,7 @@ pub(super) fn render_prompt(
          - Audit focus: {focus}\n\
          - First commit or revision to inspect: {commit}\n\n\
          Execution rules for this pass:\n\n\
-         - Work on exactly one candidate. Do not pad the report with unrelated findings.\n\
+             - Work on exactly one audit pass. Do not pad the report with unrelated speculation.\n\
          - Keep all generated files, builds, images, logs, and PoCs below the candidate directory.\n\
          - The source tree is read-only for this pass; use out-of-tree builds and temporary copies.\n\
          - Start by recording the exact git revision and source status.\n\
@@ -258,6 +264,7 @@ pub(super) fn build_child_args(
     root_config_overrides: &CliConfigOverrides,
     run_options: &RunOptions<'_>,
     candidate_dir: &Path,
+    additional_write_dirs: &[&Path],
 ) -> Vec<OsString> {
     let mut args = Vec::new();
     for override_value in &root_config_overrides.raw_overrides {
@@ -298,8 +305,10 @@ pub(super) fn build_child_args(
     // the prompt, so workspace-write cannot modify it accidentally.
     args.push(OsString::from("--cd"));
     args.push(candidate_dir.as_os_str().to_os_string());
-    args.push(OsString::from("--add-dir"));
-    args.push(run_options.output_dir.as_os_str().to_os_string());
+    for directory in additional_write_dirs {
+        args.push(OsString::from("--add-dir"));
+        args.push(directory.as_os_str().to_os_string());
+    }
     args.push(OsString::from("--add-dir"));
     args.push(candidate_dir.as_os_str().to_os_string());
     if let Some(model) = run_options.model {

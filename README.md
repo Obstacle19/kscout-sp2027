@@ -123,6 +123,44 @@ Linux 源码目录加入可写根。需要 QEMU 或挂载等特权操作时，�
 不会调用模型，因此不会生成 usage 记录。该功能只记录新版本实际运行的候选；旧候选的历史
 耗时无法追溯，不会自动补录。
 
+### Peer swarm 协同审计
+
+传入 `--swarm` 后，`--count 1` 表示一个 swarm 审计组。第一轮由多个 peer 独立选方向和挖掘；
+之后每轮都会读取并追加 `SWARM_BOARD.md`，所有 peer 可以质疑、复现、否定已有线索，也可以
+分叉寻找新线索。没有固定 reviewer，也不限制发现数量；所有参与者都可发现和审查。每个 agent
+的 prompt、命令、JSONL/stderr、usage、论证和工作文件分别保存在
+`candidates/candidate-NNN/agents/round-NN/agent-NN/` 下，符合归档条件的发现分别保存在
+`candidates/candidate-NNN/findings/` 下。
+
+默认每轮 3 个 agent，最多进行 2 轮；所有 agent 在一轮内并发。只有所有 agent 都在
+`SWARM_UPDATE.md` 明确声明没有待办线索时才会提前停止。参数范围为 2–8 个 agent 和 1–4 轮，
+单次运行最多排 64 个 child session，以限制运行开销。`confirmed` 发现还需要至少两个不同 agent 对匹配的标题和根因独立报告
+confirmed；否则归档状态会降为 `plausible`。这个门槛能减少单个 agent 误判直接成为最终确认的
+机会，但不能证明整体误报率或召回率一定改善，仍要检查 PoC、对照和原始证据。
+
+例如，在单独目录做一次 swarm 审计：
+
+```shell
+zsh -lic 'exec /root/workspace/kscout/codex-rs/target/debug/codex kernel-vuln \
+  --api-key-env DEEPSEEK_API_KEY \
+  --api-base-url https://api.deepseek.com \
+  --model deepseek-flash \
+  --disable code_mode_host \
+  --linux-path /root/workspace/linux \
+  --output-dir /root/workspace/kscout-mutiagent-workdir/swarm-run \
+  --count 1 \
+  --swarm \
+  --swarm-agents 3 \
+  --swarm-rounds 2 \
+  --show-progress \
+  --stop-on-error'
+```
+
+一组默认最多启动 6 个 child session；增加 agent 数或轮数会增加总 token，轮间论证也会增加
+墙钟时间。`PROCESS_LOG.md`、每个 session 的 `usage.json` 和根目录 `USAGE.jsonl` 记录实际用量。
+旧参数 `--multi-agent` 仍是 `--swarm` 的兼容别名。
+父进程、论证轮次、归档和验证逻辑见 [Peer swarm workflow](docs/kernel-vuln-swarm-workflow.md)。
+
 候选 token 数取自最后一个报告用量的 turn 事件中的线程累计值，不会把各 turn 的累计值重复相加。
 
 另有默认关闭的 `--use-cve-rules` CVE 派生规则模块。可用 `--focus net/sched` 只扫描该子系统中的活动规则，或用 `--cve-rule CVE-2022-0847` 精确选择一条规则；`--cve-rule` 会自动启用规则模式，也可以重复选择多个活动 CVE。当前 20 条知识库记录均有确定性扫描规则：规则从人工核实的修复中提炼漏洞条件、危险使用模式和安全不变量，再遍历对应源码范围中的 C 函数枚举候选。按主 CWE 整理的 [20 条 2022—2026 年高严重性内核 CVE 知识库](KERNEL_CVE_KNOWLEDGE.json)保存修复来源和规则验证状态；便于浏览的 [CWE/CVE 索引](docs/kernel-cve-cwe-index.md)按弱点类型汇总成因和修复不变量。严格安全过滤器只排除经过核实的精确安全形态；同一规则下相关命中合并成一个定向审查，

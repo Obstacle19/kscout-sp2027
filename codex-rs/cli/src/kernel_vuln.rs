@@ -31,6 +31,8 @@ mod kernel_vuln_rule_report;
 mod kernel_vuln_rules;
 #[path = "kernel_vuln_support.rs"]
 mod kernel_vuln_support;
+#[path = "kernel_vuln_swarm.rs"]
+mod kernel_vuln_swarm;
 #[path = "kernel_vuln_usage.rs"]
 mod kernel_vuln_usage;
 
@@ -67,6 +69,7 @@ const DEFAULT_OUTPUT_DIR: &str = "./linux-vuln-set";
 const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const FINDING_INDEX_FILE_NAME: &str = "FINDING_INDEX.md";
 const RULE_SCAN_REPORT_PREFIX: &str = "rule-scan-";
+const MAX_SWARM_SESSIONS_PER_RUN: usize = 64;
 
 const PROMPT_TEMPLATE: &str = r#"# Linux kernel vulnerability research contract
 
@@ -156,6 +159,19 @@ pub(crate) struct KernelVulnCommand {
     /// reviews one grouped CVE rule family instead of doing open-ended search.
     #[arg(long, short = 'n', default_value_t = 1)]
     count: u32,
+
+    /// Run peer agents in rounds: independent discovery, then shared-board
+    /// challenge, reproduction, and branching. --multi-agent remains an alias.
+    #[arg(long = "swarm", visible_alias = "multi-agent", default_value_t = false)]
+    swarm: bool,
+
+    /// Number of peer agents per swarm round (2 to 8).
+    #[arg(long = "swarm-agents", default_value_t = 3, value_parser = clap::value_parser!(u8).range(2..=8))]
+    swarm_agents: u8,
+
+    /// Maximum number of shared-board argument rounds (1 to 4).
+    #[arg(long = "swarm-rounds", default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=4))]
+    swarm_rounds: u8,
 
     /// Use focused, knowledge-base-guided Linux kernel reviews instead of autonomous search.
     /// Related source hits for one rule share a single model review. Disabled by default;
@@ -251,6 +267,9 @@ struct RunOptions<'a> {
     linux_path: &'a Path,
     output_dir: &'a Path,
     count: u32,
+    swarm: bool,
+    swarm_agents: u8,
+    swarm_rounds: u8,
     api_key_env: &'a str,
     api_base_url: Option<&'a str>,
     model: Option<&'a str>,
@@ -269,6 +288,9 @@ pub(crate) async fn run(
         linux_path,
         output_dir,
         count,
+        swarm,
+        swarm_agents,
+        swarm_rounds,
         api_key_env,
         api_base_url,
         model,
@@ -290,6 +312,14 @@ pub(crate) async fn run(
     ensure!(
         (1..=100).contains(&count),
         "--count must be between 1 and 100"
+    );
+    ensure!(
+        (2..=8).contains(&swarm_agents),
+        "--swarm-agents must be between 2 and 8"
+    );
+    ensure!(
+        (1..=4).contains(&swarm_rounds),
+        "--swarm-rounds must be between 1 and 4"
     );
     let custom_prompt_source = match (&extra_prompt, &extra_prompt_file) {
         (Some(_), _) => "inline text".to_string(),
@@ -321,6 +351,17 @@ pub(crate) async fn run(
         .unwrap_or_default();
     let (scheduled_count, rule_review_count) =
         scheduled_pass_counts(count, rule_reviews.len(), use_cve_rules);
+    let scheduled_child_sessions = if swarm {
+        scheduled_count
+            .saturating_mul(usize::from(swarm_agents))
+            .saturating_mul(usize::from(swarm_rounds))
+    } else {
+        scheduled_count
+    };
+    ensure!(
+        !swarm || scheduled_child_sessions <= MAX_SWARM_SESSIONS_PER_RUN,
+        "swarm run would schedule {scheduled_child_sessions} child sessions; reduce --count, --swarm-agents, or --swarm-rounds (maximum {MAX_SWARM_SESSIONS_PER_RUN} per run)"
+    );
 
     let candidates_dir = output_dir.join("candidates");
     fs::create_dir_all(&candidates_dir)
@@ -350,6 +391,9 @@ pub(crate) async fn run(
         linux_path: &linux_path,
         output_dir: &output_dir,
         count,
+        swarm,
+        swarm_agents,
+        swarm_rounds,
         api_key_env: &api_key_env,
         api_base_url: api_base_url.as_deref(),
         model: model.as_deref(),
@@ -390,7 +434,10 @@ pub(crate) async fn run(
              - Pass mode: {}\n\
              - Requested count: {count}\n\
              - Rule-family reviews scheduled: {rule_review_count}\n\
-             - Scheduled child sessions: {scheduled_count}\n\
+             - Scheduled child sessions: {scheduled_child_sessions}\n\
+             - Swarm audit groups: {swarm}\n\
+             - Swarm agents per round: {swarm_agents}\n\
+             - Swarm maximum argument rounds: {swarm_rounds}\n\
              - API key variable: {api_key_env} (value redacted)\n\
              - API base URL: {}\n\
              - Model: {}\n\
@@ -488,7 +535,12 @@ pub(crate) async fn run(
                 "\n\nThe built-in research contract remains mandatory, including source-read-only handling, a userland PoC, a close negative control, and complete evidence records. Report negative or inconclusive results honestly.",
             );
         }
-        let args = build_child_args(root_config_overrides, &run_options, &candidate_dir);
+        let args = build_child_args(
+            root_config_overrides,
+            &run_options,
+            &candidate_dir,
+            &[output_dir.as_path()],
+        );
 
         fs::create_dir_all(&candidate_dir)
             .with_context(|| format!("creating {}", candidate_dir.display()))?;
@@ -513,12 +565,15 @@ pub(crate) async fn run(
                  - dangerous bypass: {}\n\
                  - live progress: {}\n\
                  - rule mode: {}\n\
+                 - swarm mode: {swarm}\n\
+                 - swarm agents per round: {swarm_agents}\n\
+                 - swarm maximum argument rounds: {swarm_rounds}\n\
                  - rule review bundle: {}\n\
                  - additional prompt: {}\n\
                  - prompt: prompt.md\n\
                  - usage summary: usage.json\n\
-                 - event log: agent-events.jsonl\n\
-                 - stderr log: agent-stderr.log\n",
+                 - event logs: agent-events.jsonl or agents/*/agent-events.jsonl\n\
+                 - stderr logs: agent-stderr.log or agents/*/agent-stderr.log\n",
                 ordinal + 1,
                 candidate_dir.display(),
                 linux_path.display(),
@@ -559,6 +614,25 @@ pub(crate) async fn run(
         )?;
 
         if dry_run {
+            if swarm {
+                kernel_vuln_swarm::run_candidate(kernel_vuln_swarm::SwarmRunRequest {
+                    root_config_overrides,
+                    run_options: &run_options,
+                    candidate_index,
+                    candidate_dir: &candidate_dir,
+                    executable: &executable,
+                    api_key: None,
+                    run_started_at: &started_at,
+                    focus: focus.as_deref(),
+                    commit: commit.as_deref(),
+                    extra_prompt: extra_prompt.as_deref(),
+                    dry_run: true,
+                    rule_review,
+                    agent_count: usize::from(swarm_agents),
+                    round_count: usize::from(swarm_rounds),
+                })
+                .await?;
+            }
             println!(
                 "[kernel-vuln] dry-run candidate {candidate_index:03}: {}",
                 candidate_dir.display()
@@ -573,54 +647,98 @@ pub(crate) async fn run(
         );
         let candidate_started_at = Utc::now();
         let candidate_timer = Instant::now();
-        let result = run_agent(
-            &executable,
-            &args,
-            &candidate_dir,
-            &candidate_dir,
-            api_key.as_deref(),
-            &prompt,
-            show_progress,
-        )
-        .await;
+        let outcome = if swarm {
+            match kernel_vuln_swarm::run_candidate(kernel_vuln_swarm::SwarmRunRequest {
+                root_config_overrides,
+                run_options: &run_options,
+                candidate_index,
+                candidate_dir: &candidate_dir,
+                executable: &executable,
+                api_key: api_key.as_deref(),
+                run_started_at: &started_at,
+                focus: focus.as_deref(),
+                commit: commit.as_deref(),
+                extra_prompt: extra_prompt.as_deref(),
+                dry_run: false,
+                rule_review,
+                agent_count: usize::from(swarm_agents),
+                round_count: usize::from(swarm_rounds),
+            })
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => kernel_vuln_swarm::CandidateRunOutcome::failed_to_start(error),
+            }
+        } else {
+            match run_agent(
+                &executable,
+                &args,
+                &candidate_dir,
+                &candidate_dir,
+                api_key.as_deref(),
+                &prompt,
+                show_progress,
+            )
+            .await
+            {
+                Ok(status) => kernel_vuln_swarm::CandidateRunOutcome::from_single_agent(
+                    status,
+                    read_token_usage(&candidate_dir.join("agent-events.jsonl"))?,
+                ),
+                Err(error) => kernel_vuln_swarm::CandidateRunOutcome::failed_to_start(error),
+            }
+        };
         let candidate_elapsed_seconds = candidate_timer.elapsed().as_secs_f64();
         let candidate_finished_at = Utc::now();
-        let token_usage = read_token_usage(&candidate_dir.join("agent-events.jsonl"))?;
-        let (child_result, exit_code) = match &result {
-            Ok(status) if status.success() => ("success".to_string(), status.code()),
-            Ok(status) => ("failure".to_string(), status.code()),
-            Err(_) => ("failed_to_start".to_string(), None),
-        };
         let usage_record = CandidateUsageRecord {
             run_started_at: started_at.clone(),
             candidate: format!("candidate-{candidate_index:03}"),
             model: model.as_deref().unwrap_or("config/default").to_string(),
-            child_result,
-            exit_code,
+            child_result: outcome.child_result.clone(),
+            exit_code: outcome.exit_code,
             started_at: candidate_started_at.to_rfc3339(),
             finished_at: candidate_finished_at.to_rfc3339(),
             elapsed_seconds: candidate_elapsed_seconds,
             finding_outcome: read_finding_outcome(&candidate_dir.join("finding-fingerprint.md")),
-            token_usage,
+            token_usage: outcome.token_usage,
         };
         persist_candidate_usage(&usage_record, &candidate_dir, &output_dir)?;
         append_log(&process_log, &usage_record.markdown_summary())?;
         usage_records.push(usage_record);
         refresh_finding_index(&candidates_dir, &finding_index)?;
 
-        match result {
-            Ok(status) if status.success() => {
+        match outcome.child_result.as_str() {
+            "success" => {
                 println!("[kernel-vuln] candidate {candidate_index:03} finished successfully");
                 append_log(
                     &process_log,
-                    &format!("- Result: success, exit status {}\n", status_string(status)),
+                    &format!(
+                        "- Result: success{}\n",
+                        outcome
+                            .status
+                            .map(status_string)
+                            .map(|status| format!(", exit status {status}"))
+                            .unwrap_or_default()
+                    ),
                 )?;
             }
-            Ok(status) => {
-                let message = format!(
-                    "candidate {candidate_index:03} exited with {}",
-                    status_string(status)
-                );
+            "failure" | "failed_to_start" => {
+                let message = if let Some(status) = outcome.status {
+                    format!(
+                        "candidate {candidate_index:03} exited with {}{}",
+                        status_string(status),
+                        outcome
+                            .error
+                            .as_deref()
+                            .map(|error| format!(" ({error})"))
+                            .unwrap_or_default()
+                    )
+                } else {
+                    format!(
+                        "candidate {candidate_index:03} failed to start: {}",
+                        outcome.error.as_deref().unwrap_or("unknown child error")
+                    )
+                };
                 eprintln!("[kernel-vuln] {message}");
                 append_log(&process_log, &format!("- Result: failure, {message}\n"))?;
                 failures.push(message);
@@ -632,19 +750,7 @@ pub(crate) async fn run(
                     break;
                 }
             }
-            Err(error) => {
-                let message = format!("candidate {candidate_index:03} failed to start: {error:#}");
-                eprintln!("[kernel-vuln] {message}");
-                append_log(&process_log, &format!("- Result: failure, {message}\n"))?;
-                failures.push(message);
-                if stop_on_error {
-                    append_log(
-                        &process_log,
-                        "- Stop-on-error: remaining candidates were not started\n",
-                    )?;
-                    break;
-                }
-            }
+            other => bail!("unexpected candidate result `{other}`"),
         }
     }
 

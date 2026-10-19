@@ -56,6 +56,39 @@ pub(super) struct CandidateUsageRecord {
     pub(super) token_usage: TokenUsageSummary,
 }
 
+pub(super) fn aggregate_token_usage(usages: &[TokenUsageSummary]) -> TokenUsageSummary {
+    let sum = |field: fn(&TokenUsageSummary) -> Option<i64>| {
+        usages
+            .iter()
+            .map(field)
+            .try_fold(0_i64, |total, value| total.checked_add(value?))
+    };
+    let has_usage = usages.iter().any(|usage| usage.total_tokens.is_some());
+    let status = if usages.is_empty()
+        || usages
+            .iter()
+            .all(|usage| matches!(usage.status, UsageStatus::Complete))
+    {
+        UsageStatus::Complete
+    } else if has_usage {
+        UsageStatus::Partial
+    } else {
+        UsageStatus::Unavailable
+    };
+
+    TokenUsageSummary {
+        status,
+        completed_turns: usages.iter().map(|usage| usage.completed_turns).sum(),
+        usage_turns: usages.iter().map(|usage| usage.usage_turns).sum(),
+        input_tokens: sum(|usage| usage.input_tokens),
+        cached_input_tokens: sum(|usage| usage.cached_input_tokens),
+        cache_write_input_tokens: sum(|usage| usage.cache_write_input_tokens),
+        output_tokens: sum(|usage| usage.output_tokens),
+        reasoning_output_tokens: sum(|usage| usage.reasoning_output_tokens),
+        total_tokens: sum(|usage| usage.total_tokens),
+    }
+}
+
 #[derive(Default)]
 struct UsageAccumulator {
     completed_turns: u64,
@@ -265,6 +298,25 @@ pub(super) fn persist_candidate_usage(
     let line = serde_json::to_string(record).context("serializing candidate usage record")?;
     writeln!(usage_jsonl, "{line}")
         .with_context(|| format!("appending {}", usage_jsonl_path.display()))?;
+
+    let metadata_path = candidate_dir.join("run-metadata.md");
+    let mut metadata = OpenOptions::new()
+        .append(true)
+        .open(&metadata_path)
+        .with_context(|| format!("opening {}", metadata_path.display()))?;
+    metadata
+        .write_all(record.markdown_summary().as_bytes())
+        .with_context(|| format!("appending {}", metadata_path.display()))?;
+    Ok(())
+}
+
+pub(super) fn persist_nested_candidate_usage(
+    record: &CandidateUsageRecord,
+    candidate_dir: &Path,
+) -> Result<()> {
+    let usage_json = serde_json::to_vec_pretty(record).context("serializing agent usage")?;
+    fs::write(candidate_dir.join("usage.json"), usage_json)
+        .with_context(|| format!("writing usage in {}", candidate_dir.display()))?;
 
     let metadata_path = candidate_dir.join("run-metadata.md");
     let mut metadata = OpenOptions::new()
