@@ -19,6 +19,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[path = "kernel_vuln_cleanup.rs"]
+mod kernel_vuln_cleanup;
 #[path = "kernel_vuln_dedup.rs"]
 mod kernel_vuln_dedup;
 #[path = "kernel_vuln_rule_knowledge.rs"]
@@ -36,6 +38,7 @@ mod kernel_vuln_swarm;
 #[path = "kernel_vuln_usage.rs"]
 mod kernel_vuln_usage;
 
+use self::kernel_vuln_cleanup::cleanup_scratch_directory;
 use self::kernel_vuln_dedup::refresh_finding_index;
 use self::kernel_vuln_rule_prompt::render_rule_review_prompt;
 use self::kernel_vuln_rule_report::render_rule_scan_report;
@@ -98,8 +101,13 @@ Required constraints:
    actually demonstrated.
 7. Preserve evidence: source locations, the reasoning chain, control cases,
    command output, and the exact source revision.
-8. Do not modify the supplied Linux source tree. Use out-of-tree build
-   directories, temporary images, QEMU snapshots, and the candidate directory.
+8. Do not modify the supplied Linux source tree. Put source copies, out-of-tree
+   build trees, intermediate kernels, temporary images, QEMU snapshots, and
+   caches in the coordinator-provided scratch directory. Keep full reports,
+   logs, PoC source, reproduction instructions, and required evidence in the
+   persistent candidate directory. Copy and verify required evidence before
+   finishing; preserve final binaries only when needed to reproduce the issue.
+   Do not shorten or discard report text, logs, or evidence to save disk space.
 9. Save a detailed PROCESS_LOG.md describing the audit and every important
    command or decision.
 
@@ -255,6 +263,11 @@ pub(crate) struct KernelVulnCommand {
     /// Generate prompts and command files without contacting the model.
     #[arg(long)]
     dry_run: bool,
+
+    /// Keep the dedicated scratch workspace after a candidate finishes.
+    /// By default, temporary builds, images, and caches under scratch/ are removed.
+    #[arg(long)]
+    keep_workspace: bool,
 }
 
 impl KernelVulnCommand {
@@ -276,6 +289,7 @@ struct RunOptions<'a> {
     sandbox: SandboxModeCliArg,
     dangerous_bypass: bool,
     show_progress: bool,
+    keep_workspace: bool,
 }
 
 pub(crate) async fn run(
@@ -305,6 +319,7 @@ pub(crate) async fn run(
         allow_stored_auth,
         stop_on_error,
         show_progress,
+        keep_workspace,
         dry_run,
     } = command;
     let use_cve_rules = rule_mode_enabled;
@@ -400,6 +415,7 @@ pub(crate) async fn run(
         sandbox,
         dangerous_bypass: dangerously_bypass_approvals_and_sandbox,
         show_progress,
+        keep_workspace,
     };
     initialize_output_files(&run_options, &process_log)?;
     refresh_finding_index(&candidates_dir, &finding_index)?;
@@ -448,6 +464,7 @@ pub(crate) async fn run(
              - Sandbox: {}\n\
              - Dangerous bypass: {dangerously_bypass_approvals_and_sandbox}\n\
              - Live progress: {show_progress}\n\
+             - Keep scratch after each candidate: {keep_workspace}\n\
              - Dry run: {dry_run}\n",
             linux_path.display(),
             output_dir.display(),
@@ -506,12 +523,20 @@ pub(crate) async fn run(
         let (candidate_index, candidate_dir) =
             allocate_candidate_directory(&candidates_dir, next_candidate_index)?;
         next_candidate_index = candidate_index.saturating_add(1);
+        fs::create_dir_all(&candidate_dir)
+            .with_context(|| format!("creating {}", candidate_dir.display()))?;
+        let scratch_dir = candidate_dir.join("scratch");
+        if !dry_run && !swarm {
+            fs::create_dir_all(scratch_dir.join("tmp"))
+                .with_context(|| format!("creating scratch directory {}", scratch_dir.display()))?;
+        }
 
         let mut prompt = if let Some(rule_review) = rule_review {
             render_rule_review_prompt(
                 &linux_path,
                 &output_dir,
                 &candidate_dir,
+                &scratch_dir,
                 focus.as_deref(),
                 commit.as_deref(),
                 rule_review,
@@ -521,6 +546,7 @@ pub(crate) async fn run(
                 &linux_path,
                 &output_dir,
                 &candidate_dir,
+                &scratch_dir,
                 focus.as_deref(),
                 commit.as_deref(),
             )
@@ -538,12 +564,11 @@ pub(crate) async fn run(
         let args = build_child_args(
             root_config_overrides,
             &run_options,
+            &scratch_dir,
             &candidate_dir,
             &[output_dir.as_path()],
         );
 
-        fs::create_dir_all(&candidate_dir)
-            .with_context(|| format!("creating {}", candidate_dir.display()))?;
         fs::write(candidate_dir.join("prompt.md"), &prompt)
             .with_context(|| format!("writing prompt in {}", candidate_dir.display()))?;
         fs::write(
@@ -564,6 +589,8 @@ pub(crate) async fn run(
                  - sandbox: {}\n\
                  - dangerous bypass: {}\n\
                  - live progress: {}\n\
+                 - scratch directory: {}\n\
+                 - keep scratch after run: {}\n\
                  - rule mode: {}\n\
                  - swarm mode: {swarm}\n\
                  - swarm agents per round: {swarm_agents}\n\
@@ -583,6 +610,8 @@ pub(crate) async fn run(
                 sandbox_name(sandbox),
                 dangerously_bypass_approvals_and_sandbox,
                 show_progress,
+                scratch_dir.display(),
+                keep_workspace,
                 use_cve_rules,
                 rule_review
                     .map(|review| format!(
@@ -627,6 +656,7 @@ pub(crate) async fn run(
                     commit: commit.as_deref(),
                     extra_prompt: extra_prompt.as_deref(),
                     dry_run: true,
+                    keep_workspace,
                     rule_review,
                     agent_count: usize::from(swarm_agents),
                     round_count: usize::from(swarm_rounds),
@@ -660,6 +690,7 @@ pub(crate) async fn run(
                 commit: commit.as_deref(),
                 extra_prompt: extra_prompt.as_deref(),
                 dry_run: false,
+                keep_workspace,
                 rule_review,
                 agent_count: usize::from(swarm_agents),
                 round_count: usize::from(swarm_rounds),
@@ -673,7 +704,7 @@ pub(crate) async fn run(
             match run_agent(
                 &executable,
                 &args,
-                &candidate_dir,
+                &scratch_dir,
                 &candidate_dir,
                 api_key.as_deref(),
                 &prompt,
@@ -688,6 +719,28 @@ pub(crate) async fn run(
                 Err(error) => kernel_vuln_swarm::CandidateRunOutcome::failed_to_start(error),
             }
         };
+        let cleanup_note = if swarm {
+            format!(
+                "per-agent scratch cleanup status is recorded under {}/agents/*/workspace-cleanup.md; unrecorded scratch may remain after an archive error",
+                candidate_dir.display()
+            )
+        } else if keep_workspace {
+            format!("retained by --keep-workspace: {}", scratch_dir.display())
+        } else {
+            match cleanup_scratch_directory(&candidate_dir, &scratch_dir) {
+                Ok(()) => format!("removed {}", scratch_dir.display()),
+                Err(error) => format!("failed to remove {}: {error:#}", scratch_dir.display()),
+            }
+        };
+        fs::write(
+            candidate_dir.join("workspace-cleanup.md"),
+            format!("Scratch workspace cleanup: {cleanup_note}\n"),
+        )
+        .with_context(|| format!("writing cleanup record in {}", candidate_dir.display()))?;
+        append_log(
+            &process_log,
+            &format!("- Scratch cleanup: {cleanup_note}\n"),
+        )?;
         let candidate_elapsed_seconds = candidate_timer.elapsed().as_secs_f64();
         let candidate_finished_at = Utc::now();
         let usage_record = CandidateUsageRecord {

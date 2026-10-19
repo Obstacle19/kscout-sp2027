@@ -85,7 +85,8 @@ pub(super) fn initialize_output_files(
              - Model: {}\n\
              - Sandbox: {}\n\
              - Dangerous bypass: {}\n\
-             - Live progress: {}\n\n\
+             - Live progress: {}\n\
+             - Keep scratch workspaces after runs: {}\n\n\
              ## Layout\n\n\
              - PROCESS_LOG.md: orchestrator-level timeline and statuses.\n\
              - FINDING_INDEX.md: prior candidate fingerprints used to exclude duplicate findings.\n\
@@ -93,7 +94,8 @@ pub(super) fn initialize_output_files(
              - rule-scan-*.md: optional deterministic CVE-derived candidate enumeration and filter report.\n\
              - PROMPT_TEMPLATE.md: fixed research contract.\n\
              - source-status-before.txt and source-status-after.txt: source-tree checks.\n\
-             - candidates/candidate-NNN/: one isolated audit pass or peer swarm group with per-finding archives.\n",
+             - candidates/candidate-NNN/: one isolated audit pass or peer swarm group with per-finding archives.\n\n\
+             Each child uses a dedicated scratch/ directory for temporary builds, images, and caches. It is removed after evidence is persisted; swarm scratch is removed after each round. Use --keep-workspace to retain scratch for debugging. Full reports, logs, PoCs, and reproduction evidence remain in the persistent candidate workspaces.\n",
             run_options.linux_path.display(),
             run_options.count,
             run_options.swarm,
@@ -105,6 +107,7 @@ pub(super) fn initialize_output_files(
             sandbox_name(run_options.sandbox),
             run_options.dangerous_bypass,
             run_options.show_progress,
+            run_options.keep_workspace,
         ),
     )?;
     write_if_missing(&output_dir.join("PROMPT_TEMPLATE.md"), PROMPT_TEMPLATE)?;
@@ -231,6 +234,7 @@ pub(super) fn render_prompt(
     linux_path: &Path,
     output_dir: &Path,
     candidate_dir: &Path,
+    scratch_dir: &Path,
     focus: Option<&str>,
     commit: Option<&str>,
 ) -> String {
@@ -243,12 +247,16 @@ pub(super) fn render_prompt(
          - Linux source: {linux_path}\n\
          - Overall output directory: {output_dir}\n\
          - Candidate directory: {candidate_dir}\n\
+         - Temporary scratch directory: {scratch_dir}\n\
+         - The child process working directory is scratch; relative temporary outputs go there. Use the absolute candidate directory for persistent reports and evidence.\n\
          - Duplicate exclusion index: {finding_index}\n\
          - Audit focus: {focus}\n\
          - First commit or revision to inspect: {commit}\n\n\
          Execution rules for this pass:\n\n\
              - Work on exactly one audit pass. Do not pad the report with unrelated speculation.\n\
-         - Keep all generated files, builds, images, logs, and PoCs below the candidate directory.\n\
+         - Use the temporary scratch directory for source copies, build trees, object files, intermediate kernels, VM disks and snapshots, temporary root filesystems/initramfs images, downloads, and caches.\n\
+         - Keep persistent deliverables in the candidate directory: full reports, logs, PoC source, exact commands, reproduction instructions, fingerprints, revision/configuration details, and positive/control output. Preserve final binaries only when they are needed to reproduce the finding. Never leave the only copy of a required report, log, PoC, or evidence in scratch. Do not shorten or discard text reports, logs, or evidence to save disk space.\n\
+         - Before finishing, copy required evidence out of scratch and verify the persistent copies. Do not keep build trees or temporary development environments in the persistent candidate directory.\n\
          - The source tree is read-only for this pass; use out-of-tree builds and temporary copies.\n\
          - Start by recording the exact git revision and source status.\n\
          - Before claiming success, run the PoC twice from a fresh setup and run at least one close control.\n\
@@ -256,6 +264,7 @@ pub(super) fn render_prompt(
         linux_path = linux_path.display(),
         output_dir = output_dir.display(),
         candidate_dir = candidate_dir.display(),
+        scratch_dir = scratch_dir.display(),
         finding_index = finding_index.display(),
     )
 }
@@ -263,6 +272,7 @@ pub(super) fn render_prompt(
 pub(super) fn build_child_args(
     root_config_overrides: &CliConfigOverrides,
     run_options: &RunOptions<'_>,
+    working_dir: &Path,
     candidate_dir: &Path,
     additional_write_dirs: &[&Path],
 ) -> Vec<OsString> {
@@ -300,11 +310,11 @@ pub(super) fn build_child_args(
     args.push(OsString::from("--skip-git-repo-check"));
     args.push(OsString::from("--ephemeral"));
     args.push(OsString::from("--json"));
-    // Keep the agent's writable workspace rooted at the candidate directory.
-    // The Linux source tree is intentionally only an explicit read target in
-    // the prompt, so workspace-write cannot modify it accidentally.
+    // Run commands from disposable scratch while allowing persistent evidence
+    // to be written to the candidate and output directories. The Linux source
+    // tree remains outside the writable roots.
     args.push(OsString::from("--cd"));
-    args.push(candidate_dir.as_os_str().to_os_string());
+    args.push(working_dir.as_os_str().to_os_string());
     for directory in additional_write_dirs {
         args.push(OsString::from("--add-dir"));
         args.push(directory.as_os_str().to_os_string());
@@ -345,10 +355,24 @@ pub(super) async fn run_agent(
     prompt: &str,
     show_progress: bool,
 ) -> Result<ExitStatus> {
+    fs::create_dir_all(working_dir.join("tmp")).with_context(|| {
+        format!(
+            "creating temporary directory below {}",
+            working_dir.display()
+        )
+    })?;
     let mut command = Command::new(executable);
     command
         .args(args)
         .current_dir(working_dir)
+        .env("TMPDIR", working_dir.join("tmp"))
+        .env("TMP", working_dir.join("tmp"))
+        .env("TEMP", working_dir.join("tmp"))
+        .env("XDG_CACHE_HOME", working_dir.join("cache"))
+        .env("CARGO_TARGET_DIR", working_dir.join("cargo-target"))
+        .env("PIP_CACHE_DIR", working_dir.join("pip-cache"))
+        .env("CCACHE_DIR", working_dir.join("ccache"))
+        .env("KBUILD_OUTPUT", working_dir.join("kernel-build"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

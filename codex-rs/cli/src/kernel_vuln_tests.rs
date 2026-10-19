@@ -58,10 +58,12 @@ fn child_command_keeps_api_key_out_of_argv() {
         sandbox: SandboxModeCliArg::ReadOnly,
         dangerous_bypass: false,
         show_progress: true,
+        keep_workspace: false,
     };
     let args = build_child_args(
         &CliConfigOverrides::default(),
         &run_options,
+        Path::new("/tmp/output/candidates/candidate-001/scratch"),
         Path::new("/tmp/output/candidates/candidate-001"),
         &[Path::new("/tmp/output")],
     );
@@ -70,7 +72,7 @@ fn child_command_keeps_api_key_out_of_argv() {
 
     assert!(!rendered.contains("sk-secret"));
     assert!(rendered.contains("exec"));
-    assert!(rendered.contains("--cd /tmp/output/candidates/candidate-001"));
+    assert!(rendered.contains("--cd /tmp/output/candidates/candidate-001/scratch"));
     assert!(rendered.contains("--add-dir /tmp/output"));
     assert!(rendered.contains("--sandbox read-only"));
     assert!(rendered.ends_with(" -"));
@@ -117,6 +119,7 @@ fn prompt_contains_each_runtime_output_path() {
         Path::new("/tmp/linux"),
         Path::new("/tmp/output"),
         Path::new("/tmp/output/candidates/candidate-001"),
+        Path::new("/tmp/output/candidates/candidate-001/scratch"),
         Some("fs/ntfs3"),
         Some("deadbeef"),
     );
@@ -215,11 +218,12 @@ done
 cat >/dev/null
 printf 'Mock participant completed.\n' > "$final_path"
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}'
-agent=$(basename "$PWD")
-cat > "$PWD/candidate-report.md" <<'EOF'
+workspace=$(dirname "$PWD")
+agent=$(basename "$workspace")
+cat > "$workspace/candidate-report.md" <<'EOF'
 Mock report with reproducible evidence.
 EOF
-cat > "$PWD/finding-fingerprint.md" <<'EOF'
+cat > "$workspace/finding-fingerprint.md" <<'EOF'
 Outcome: confirmed
 Title: Shared mock issue
 Subsystem: test
@@ -232,11 +236,11 @@ Duplicate-of: none
 EOF
 for number in 01 02 03; do
   lead="lead-"$agent"-"$number
-  mkdir -p "$PWD/findings/$lead"
-  cat > "$PWD/findings/$lead/candidate-report.md" <<EOF
+  mkdir -p "$workspace/findings/$lead"
+  cat > "$workspace/findings/$lead/candidate-report.md" <<EOF
 Distinct mock report for $lead.
 EOF
-  cat > "$PWD/findings/$lead/finding-fingerprint.md" <<EOF
+  cat > "$workspace/findings/$lead/finding-fingerprint.md" <<EOF
 Outcome: confirmed
 Title: Distinct issue $lead
 Subsystem: test
@@ -248,14 +252,14 @@ Affected revision: fixture
 Duplicate-of: none
 EOF
 done
-cat > "$PWD/SWARM_UPDATE.md" <<'EOF'
+cat > "$workspace/SWARM_UPDATE.md" <<'EOF'
 Round status: active
 No mock follow-up required.
 EOF
 case "$PWD" in
   */round-02/*)
-    if grep -q '## Round 1 contributions' "$PWD/../../../SWARM_BOARD.md"; then
-      printf 'Round 1 board read successfully.\n' > "$PWD/SWARM_BOARD_SEEN.md"
+    if grep -q '## Round 1 contributions' "$workspace/../../../SWARM_BOARD.md"; then
+      printf 'Round 1 board read successfully.\n' > "$workspace/SWARM_BOARD_SEEN.md"
     fi
     ;;
 esac
@@ -281,6 +285,7 @@ esac
         sandbox: SandboxModeCliArg::WorkspaceWrite,
         dangerous_bypass: false,
         show_progress: false,
+        keep_workspace: false,
     };
     let root_config_overrides = CliConfigOverrides::default();
     let run_started_at = chrono::Utc::now().to_rfc3339();
@@ -297,6 +302,7 @@ esac
             commit: None,
             extra_prompt: None,
             dry_run: false,
+            keep_workspace: false,
             rule_review: None,
             agent_count: 2,
             round_count: 2,

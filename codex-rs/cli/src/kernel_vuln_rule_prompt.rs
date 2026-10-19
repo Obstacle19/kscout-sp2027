@@ -8,6 +8,7 @@ pub(super) fn render_rule_review_prompt(
     linux_path: &Path,
     output_dir: &Path,
     candidate_dir: &Path,
+    scratch_dir: &Path,
     focus: Option<&str>,
     commit: Option<&str>,
     review: &RuleReview,
@@ -22,6 +23,8 @@ pub(super) fn render_rule_review_prompt(
          - Linux source: {}\n\
          - Overall output directory: {}\n\
          - Candidate directory: {}\n\
+         - Temporary scratch directory: {}\n\
+         - The child process working directory is scratch; relative temporary outputs go there. Use the absolute candidate directory for persistent reports and evidence.\n\
          - Duplicate exclusion index: {}\n\
          - Requested focus: {}\n\
          - Requested revision/commit: {}\n\n\
@@ -42,6 +45,7 @@ pub(super) fn render_rule_review_prompt(
         linux_path.display(),
         output_dir.display(),
         candidate_dir.display(),
+        scratch_dir.display(),
         finding_index.display(),
         focus.unwrap_or("all active rule scopes"),
         commit.unwrap_or("current HEAD"),
@@ -88,7 +92,8 @@ pub(super) fn render_rule_review_prompt(
          2. Read FINDING_INDEX only to exclude duplicate root causes. Compare the candidate route with the recorded validation gate and sinks. If revision, guard, and route are unchanged, reuse the recorded trace and controls without reconstructing them; if they changed or a candidate bypasses them, trace only that delta or bypass once. Do not turn each location into a separate candidate.\n\
          3. If the verified guard covers the reachable class and no distinct residual condition remains, report negative or duplicate with the source/control evidence and stop. Do not search for unrelated vulnerabilities in this pass.\n\
          4. For a distinct reachable violation, establish its invariant and user-controlled trigger. Build one userland PoC for the root cause, run it twice from fresh setups, and run a close negative control. Never trigger a kernel bug or potentially destabilizing input on the host kernel; use a disposable VM with a snapshot and an out-of-tree kernel build. If no isolated target is available, do not run the trigger and report the runtime result as inconclusive. Never modify the supplied Linux tree.\n\
-         5. Keep the PoC, builds, images, logs, and reports under the candidate directory. Record exact commands, raw output, source references, impact, and limitations in PROCESS_LOG.md and candidate-report.md. Write finding-fingerprint.md with first line `Outcome: confirmed`, `plausible`, `negative`, `inconclusive`, or `duplicate`. Never promote an unresolved knowledge-base hypothesis without new evidence.\n",
+         5. Use the temporary scratch directory for source copies, build trees, object files, intermediate kernels, VM disks and snapshots, temporary root filesystems/initramfs images, downloads, and caches. Keep full reports, logs, PoC source, exact commands, reproduction instructions, fingerprints, revision/configuration details, and positive/control output in the persistent candidate directory. Preserve final binaries only when needed to reproduce the finding. Never leave the only copy of a required artifact in scratch; copy and verify it before finishing. Do not keep build trees or temporary development environments in the persistent candidate directory. Do not shorten or discard text reports, logs, or evidence to save disk space.\n\
+         6. Record exact commands, raw output, source references, impact, and limitations in PROCESS_LOG.md and candidate-report.md. Write finding-fingerprint.md with first line `Outcome: confirmed`, `plausible`, `negative`, `inconclusive`, or `duplicate`. Never promote an unresolved knowledge-base hypothesis without new evidence.\n",
     );
     prompt
 }

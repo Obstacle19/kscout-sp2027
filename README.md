@@ -1,242 +1,177 @@
-# Linux 内核漏洞挖掘平台
+# KScout：Linux 内核漏洞挖掘平台
 
-本仓库是面向 Linux 内核源码与提交历史的专用漏洞挖掘平台。平台基于 Codex CLI 的 agent、模型调用和执行能力构建，主要入口是 `codex kernel-vuln`。
+KScout 基于 Codex CLI 构建，用于审查 Linux 内核源码和提交历史、验证可疑缺陷，并保存可复核的报告、PoC 和实验记录。它提供单 agent、peer swarm 和可选的 CVE 派生规则审查模式。
 
-## 平台工作流
-
-- 扫描指定 Linux 源码树，确定性枚举安全相关代码候选；源码树作为审计输入，候选运行材料保存在单独的输出目录。
-- 使用可选的 CVE 派生规则，从经过核实的历史修复中提取漏洞成因、危险条件和安全不变量。规则模式默认关闭，可按子系统或 CVE 选择。
-- 将相关位置按规则家族合并，交给 agent 做语义审查，并复用已核实的追踪与控制结果。
-- 按研究流程尝试 PoC、控制实验和 QEMU 验证，并保存报告、日志和证据。每个结果都需要结合复现证据人工核查；扫描命中本身不代表已确认漏洞。
-
-当前规则库包含 20 条 2022—2026 年高严重性 Linux 内核 CVE 派生规则，按主 CWE 分类。规则说明、命令参数及验证边界见[操作指南](docs/kernel-vuln-hunt.md)，按 CWE 浏览见[CVE/CWE 索引](docs/kernel-cve-cwe-index.md)，机器可读记录见 [KERNEL_CVE_KNOWLEDGE.json](KERNEL_CVE_KNOWLEDGE.json)。
+KScout 仓库不包含 Linux 源码树。运行时请通过 `--linux-path` 指定本机 Linux checkout；下面的命令面向从仓库根目录启动的使用方式，不依赖某个固定的 clone 路径。
 
 ## 快速开始
 
-### 构建 CLI
+### 1. 构建 CLI
+
+构建需要 Rust 工具链；实际运行还需要可用的 Codex 模型/API 配置。仓库根目录下运行：
 
 ```shell
-cd /root/workspace/codex/codex-rs
-cargo build -p codex-cli --bin codex
+cd codex-rs
+cargo build --locked -p codex-cli --bin codex
+cd ..
 ```
 
-### 先执行 dry-run
+构建出的程序位于 `codex-rs/target/debug/codex`。
 
-生成 prompt 和输出目录结构，但不会调用模型：
+### 2. 先生成 dry-run 产物
+
+`--dry-run` 会生成 prompt、命令和目录结构，不会启动模型会话：
 
 ```shell
-/root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
-  --linux-path /root/workspace/linux \
-  --output-dir /root/workspace/linux-vuln-set \
+./codex-rs/target/debug/codex kernel-vuln \
+  --linux-path /path/to/linux \
+  --output-dir ./kscout-workdir \
   --count 1 \
-  --model test-model \
   --dry-run
 ```
 
-### 开始实际挖掘
+把 `/path/to/linux` 换成本机 Linux 源码目录。建议始终显式传入 `--linux-path`，避免依赖不同机器上的默认路径。
 
-通过环境变量设置 API key。API key 不会出现在命令行参数或过程日志中：
+### 3. 运行一次单 agent 审计
+
+默认使用 `OPENAI_API_KEY`。密钥通过环境变量提供，不要把它写进命令参数或报告：
 
 ```shell
 export OPENAI_API_KEY='your-api-key'
 
-/root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
-  --linux-path /root/workspace/linux \
-  --output-dir /root/workspace/linux-vuln-set \
+./codex-rs/target/debug/codex kernel-vuln \
+  --linux-path /path/to/linux \
+  --output-dir ./kscout-workdir \
   --count 1 \
   --show-progress
 ```
 
-### 使用 DeepSeek API
-
-如果 key 位于 `DEEPSEEK_API_KEY`，请这样运行：
+若使用其他兼容 Responses API 的服务，可指定对应环境变量、API 地址和模型：
 
 ```shell
-export DEEPSEEK_API_KEY='your-deepseek-api-key'
+export PROVIDER_API_KEY='your-api-key'
 
+./codex-rs/target/debug/codex kernel-vuln \
+  --api-key-env PROVIDER_API_KEY \
+  --api-base-url https://api.example.com/v1 \
+  --model model-name \
+  --linux-path /path/to/linux \
+  --output-dir ./kscout-workdir \
+  --count 1
+```
+
+在当前工作区使用 DeepSeek 的命令示例（请先在环境中设置 `DEEPSEEK_API_KEY`）：
+
+```shell
 /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
   --api-key-env DEEPSEEK_API_KEY \
   --api-base-url https://api.deepseek.com \
   --model deepseek-flash \
   --disable code_mode_host \
   --linux-path /root/workspace/linux \
-  --output-dir /root/workspace/linux-vuln-set \
-  --count 1 \
-  --show-progress
-```
-
-如果 key 是在 zsh 登录配置中设置的，也可以用下面的命令启动。`zsh -lic` 会加载
-登录 shell 的环境变量，`exec` 会让 Codex CLI 直接成为该 shell 的前台进程：
-
-```shell
-zsh -lic 'exec /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
-  --api-key-env DEEPSEEK_API_KEY \
-  --api-base-url https://api.deepseek.com \
-  --model deepseek-flash \
-  --disable code_mode_host \
-  --linux-path /root/workspace/linux \
-  --output-dir /root/workspace/linux-vuln-set \
+  --output-dir /root/workspace/kscout-workdir \
   --count 1 \
   --show-progress \
-  --stop-on-error'
+  --stop-on-error
 ```
 
-运行前可以只检查 key 是否存在，不会打印 key 内容：
+这是与当前开发环境对应的示例；其他 clone 路径下请替换可执行文件和 Linux 源码路径。
+
+## 审计模式
+
+### 单 agent
+
+默认模式下，`--count 1` 安排一个独立候选审计任务。增大 `--count` 会顺序安排更多候选任务；它表示任务数，不代表漏洞数或成功保证。结果可能是 `confirmed`、`plausible`、`negative`、`inconclusive`、重复线索或运行失败。
+
+### Peer swarm
+
+`--swarm` 把一个候选任务交给多个平等的 peer。第一轮独立挖掘，后续轮次读取共享论证板，互相质疑、复现、否定或分叉新线索。没有固定 reviewer，也不限制发现数量；最终结论仍须由源码路径、PoC、对照实验和日志证据支撑。
 
 ```shell
-zsh -lic 'if [[ -n "$DEEPSEEK_API_KEY" ]]; then
-  echo "DEEPSEEK_API_KEY is set"
-else
-  echo "DEEPSEEK_API_KEY is not set" >&2
-  exit 1
-fi'
-```
-
-这里省略 `--model` 表示继承 `~/.codex/config.toml` 中的 `model`。如果需要
-覆盖模型，再添加 `--model <实际模型名>`；`your-model` 只是占位符，不能原样输入。
-`--show-progress`（也可以写成 `--verbose`）会把子进程的思考摘要、命令、命令输出
-和最终消息实时转发到终端；不加该参数时只在结束后保存日志。
-默认沙箱会把每个 `candidate-NNN` 作为可写工作区，以便保存 PoC 和证据，同时不把
-Linux 源码目录加入可写根。需要 QEMU 或挂载等特权操作时，只应在隔离实验环境中显式
-使用 `--dangerously-bypass-approvals-and-sandbox`。
-
-### 重复运行与实时观察
-
-上面的命令每次会自动化执行一次独立候选挖掘：读取 Linux 源码和提交历史，调用指定模型
-进行审计，尝试构建用户态 PoC，执行控制实验和 QEMU 验证，并把报告、日志和证据保存到
-输出目录。`--count 1` 表示本次只执行一个候选任务，并不保证一定能找到有效漏洞；结果也
-可能是 `negative`、`inconclusive`、构建失败或 API 失败。
-
-在同一个输出目录再次运行时，工具会跳过已经存在的 `candidate-NNN`，并分配下一个目录，
-例如继续生成 `candidate-008`。每轮结束后，工具会从已有候选的
-`finding-fingerprint.md`（旧结果则读取 `agent-final.md` 或 `report.md`）重建
-`FINDING_INDEX.md`，并要求后续模型只把它用于排除相同根因。每轮也会保存自己的
-`finding-fingerprint.md`，记录子系统、代码位置、根因、触发路径和 oracle。该机制依赖模型
-比较语义，能降低重复概率，但不能保证绝对零重复；应复核新报告和索引。使用新的输出目录
-会从空索引开始，不能沿用旧目录的排除记录。
-
-每个实际启动的候选会把运行时间、子进程结果、发现状态和可用 token usage 写入
-`candidates/candidate-NNN/usage.json`，并追加到根目录的 `USAGE.jsonl`。`PROCESS_LOG.md`
-记录每轮汇总。若 usage 未报告，token 字段会显示为不可用；若有 turn 用量缺失，记录会标为
-`partial`，token 值为最近一次已报告的累计值，可能不包含缺失 turn。原始 usage 也保存在
-`agent-events.jsonl` 中。`--dry-run`
-不会调用模型，因此不会生成 usage 记录。该功能只记录新版本实际运行的候选；旧候选的历史
-耗时无法追溯，不会自动补录。
-
-### Peer swarm 协同审计
-
-传入 `--swarm` 后，`--count 1` 表示一个 swarm 审计组。第一轮由多个 peer 独立选方向和挖掘；
-之后每轮都会读取并追加 `SWARM_BOARD.md`，所有 peer 可以质疑、复现、否定已有线索，也可以
-分叉寻找新线索。没有固定 reviewer，也不限制发现数量；所有参与者都可发现和审查。每个 agent
-的 prompt、命令、JSONL/stderr、usage、论证和工作文件分别保存在
-`candidates/candidate-NNN/agents/round-NN/agent-NN/` 下，符合归档条件的发现分别保存在
-`candidates/candidate-NNN/findings/` 下。
-
-默认每轮 3 个 agent，最多进行 2 轮；所有 agent 在一轮内并发。只有所有 agent 都在
-`SWARM_UPDATE.md` 明确声明没有待办线索时才会提前停止。参数范围为 2–8 个 agent 和 1–4 轮，
-单次运行最多排 64 个 child session，以限制运行开销。`confirmed` 发现还需要至少两个不同 agent 对匹配的标题和根因独立报告
-confirmed；否则归档状态会降为 `plausible`。这个门槛能减少单个 agent 误判直接成为最终确认的
-机会，但不能证明整体误报率或召回率一定改善，仍要检查 PoC、对照和原始证据。
-
-例如，在单独目录做一次 swarm 审计：
-
-```shell
-zsh -lic 'exec /root/workspace/kscout/codex-rs/target/debug/codex kernel-vuln \
-  --api-key-env DEEPSEEK_API_KEY \
-  --api-base-url https://api.deepseek.com \
-  --model deepseek-flash \
-  --disable code_mode_host \
-  --linux-path /root/workspace/linux \
-  --output-dir /root/workspace/kscout-mutiagent-workdir/swarm-run \
+./codex-rs/target/debug/codex kernel-vuln \
+  --linux-path /path/to/linux \
+  --output-dir ./kscout-swarm-run \
   --count 1 \
   --swarm \
   --swarm-agents 3 \
   --swarm-rounds 2 \
-  --show-progress \
-  --stop-on-error'
+  --show-progress
 ```
 
-一组默认最多启动 6 个 child session；增加 agent 数或轮数会增加总 token，轮间论证也会增加
-墙钟时间。`PROCESS_LOG.md`、每个 session 的 `usage.json` 和根目录 `USAGE.jsonl` 记录实际用量。
-旧参数 `--multi-agent` 仍是 `--swarm` 的兼容别名。
-父进程、论证轮次、归档和验证逻辑见 [Peer swarm workflow](docs/kernel-vuln-swarm-workflow.md)。
+默认每轮 3 个 agent、最多 2 轮；一轮内并发、轮次之间顺序执行。`--count 1` 是一个 swarm 组，默认最多安排 6 个 child session。可用 `--swarm-agents` 设置 2–8 个 peer，用 `--swarm-rounds` 设置 1–4 轮。一个 finding 要保留为 swarm 级 `confirmed`，还需要至少两个不同 peer 独立报告相符的标题和根因；否则归档会降为 `plausible`。`--multi-agent` 仍是 `--swarm` 的兼容别名。不同模型、源码版本和审计范围下的效果可能不同，swarm 不保证更短耗时、更低 token 开销或更低误报率。
 
-候选 token 数取自最后一个报告用量的 turn 事件中的线程累计值，不会把各 turn 的累计值重复相加。
+### CVE 派生规则
 
-另有默认关闭的 `--use-cve-rules` CVE 派生规则模块。可用 `--focus net/sched` 只扫描该子系统中的活动规则，或用 `--cve-rule CVE-2022-0847` 精确选择一条规则；`--cve-rule` 会自动启用规则模式，也可以重复选择多个活动 CVE。当前 20 条知识库记录均有确定性扫描规则：规则从人工核实的修复中提炼漏洞条件、危险使用模式和安全不变量，再遍历对应源码范围中的 C 函数枚举候选。按主 CWE 整理的 [20 条 2022—2026 年高严重性内核 CVE 知识库](KERNEL_CVE_KNOWLEDGE.json)保存修复来源和规则验证状态；便于浏览的 [CWE/CVE 索引](docs/kernel-cve-cwe-index.md)按弱点类型汇总成因和修复不变量。严格安全过滤器只排除经过核实的精确安全形态；同一规则下相关命中合并成一个定向审查，
-并且每次只向模型提供对应活动规则家族的知识，未变化的验证路径和控制结果直接复用，避免重复追踪同一数据流。启用规则后，
-`--count` 是定向审查的总上限，开放式自主搜索不再并行追加；规则命中较少时只运行实际可审查
-的规则组。审查仍沿用现有 PoC、控制实验和证据流程。解析器和过滤器边界、CVE 来源以及扫描报告格式见
-[kernel-vuln-hunt.md](docs/kernel-vuln-hunt.md#可选的-cve-派生规则筛选)。
+规则模式默认关闭。`--use-cve-rules` 使用维护的 CVE 派生规则审查源码；可以用 `--focus net/sched` 限定子系统，或用 `--cve-rule CVE-2022-0847` 选择 CVE，也可以重复传入多个 `--cve-rule`。此模式下 `--count` 是规则审查总数上限。规则匹配只用于生成审查线索，不等于发现漏洞。
 
-如果希望完全独立地保存一轮实验，使用新的输出目录：
+规则来源和验证边界见[操作指南](docs/kernel-vuln-hunt.md)、[CVE/CWE 索引](docs/kernel-cve-cwe-index.md)和[机器可读规则库](KERNEL_CVE_KNOWLEDGE.json)。
+
+## 运行参数
+
+| 参数 | 作用 |
+| --- | --- |
+| `--linux-path PATH` | Linux 源码树；建议显式提供。 |
+| `--output-dir DIR` | 报告和运行产物目录；README 示例使用 `./kscout-workdir`，相对于启动命令时的当前目录。 |
+| `--count N` | 单 agent 候选数，或 swarm 组数；规则模式下是规则审查上限。 |
+| `--swarm` | 启用 peer swarm。 |
+| `--swarm-agents N` / `--swarm-rounds N` | 配置每轮 peer 数量和最大论证轮数。 |
+| `--model NAME` | 覆盖配置文件中的模型。 |
+| `--api-key-env NAME` / `--api-base-url URL` | 选择 API key 环境变量和兼容 API 地址。 |
+| `--focus TEXT` / `--commit REV` | 指定审查主题和优先检查的提交或 revision。 |
+| `--show-progress` | 将 child 的进度和命令输出实时转发到终端；`--verbose` 是别名。 |
+| `--stop-on-error` | child 失败后停止后续候选任务。 |
+| `--dry-run` | 只生成 prompt 和命令，不启动模型。 |
+| `--keep-workspace` | 保留临时 `scratch/`，用于调试；默认清理。 |
+
+完整参数、API 配置、沙箱和 CVE 规则细节见[Linux 漏洞挖掘操作指南](docs/kernel-vuln-hunt.md)。
+
+## 输出目录与空间管理
+
+输出目录会包含运行级日志和候选目录，主要文件包括：
+
+- `PROCESS_LOG.md`：父进程运行时间线、状态和 scratch 清理记录。
+- `USAGE.jsonl`：各候选或 swarm 组的耗时与可用 token usage。
+- `FINDING_INDEX.md`：历史 finding 摘要，用于提示 agent 排除重复根因。
+- `candidates/candidate-NNN/`：prompt、命令、metadata、完整事件/错误日志、报告和 fingerprint。
+- `candidates/candidate-NNN/agents/round-NN/agent-NN/`：swarm peer 的独立持久工作区和论证记录。
+- `candidates/candidate-NNN/findings/`：符合归档条件的 swarm finding 副本。
+
+报告、日志、PoC 源码、复现步骤、revision/configuration 信息和正负对照证据会保存在持久目录中，不会为了节省磁盘而压缩或删减文字。临时源码副本、构建树、中间内核、VM 磁盘、临时 rootfs/initramfs 和缓存放在专属 `scratch/` 中：单 agent 完成后清理，swarm 在每轮归档 finding 后清理。若归档失败，swarm 会保留该轮 scratch，避免丢失尚未归档的证据。使用 `--keep-workspace` 可保留 scratch；每个工作区的 `workspace-cleanup.md` 和根级 `PROCESS_LOG.md` 会记录清理结果。
+
+同一输出目录再次运行时，KScout 会跳过已有候选目录并继续分配编号，同时重建排重索引。需要一份独立的实验记录时，请使用新的 `--output-dir`。索引用于提示去重，不保证完全避免重复发现。
+
+查看一轮运行的状态和产物时，可以从输出目录检查：
 
 ```shell
-zsh -lic 'exec /root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
-  --api-key-env DEEPSEEK_API_KEY \
-  --api-base-url https://api.deepseek.com \
-  --model deepseek-flash \
-  --disable code_mode_host \
-  --linux-path /root/workspace/linux \
-  --output-dir /root/workspace/linux-vuln-set-run-002 \
-  --count 1 \
-  --show-progress \
-  --stop-on-error'
+less ./kscout-workdir/PROCESS_LOG.md
+less ./kscout-workdir/candidates/candidate-001/finding-fingerprint.md
+find ./kscout-workdir/candidates/candidate-001 -maxdepth 4 -type f | sort
 ```
 
-`--show-progress` 开启后，终端会显示类似普通 Codex 会话的线程、工具调用、命令输出、
-重连和最终消息。按 `Ctrl-C` 会中断当前运行；已经写入磁盘的日志和证据通常仍会保留。
-如果只想后台观察已写入的日志，可以使用：
+## 安全与结果核查
 
-```shell
-tail -f /root/workspace/linux-vuln-set/PROCESS_LOG.md
-tail -f /root/workspace/linux-vuln-set/candidates/candidate-007/agent-stderr.log
-```
+默认配置不会把 Linux 源码目录加入 child 的可写工作区，研究合同也要求将它作为只读输入。agent 应给出用户态 PoC、可观察 oracle、接近的负对照和重复实验，并披露失败结果与不确定性。不要在宿主机上运行可能导致内核崩溃或状态破坏的触发程序；需要内核触发验证时，应使用可丢弃的隔离 VM。`--dangerously-bypass-approvals-and-sandbox` 会关闭审批和沙箱，因此只应在隔离实验环境中使用。
 
-### 结果检查命令
+CLI 正常退出或 fingerprint 写有 `confirmed`，都不能单独证明漏洞有效。请检查报告、PoC、原始日志、触发前提、正负对照和复现结果。单 agent 与 swarm 的工作流和限制见[单 agent 工作流](docs/kernel-vuln-workflow.md)及[Peer swarm 工作流](docs/kernel-vuln-swarm-workflow.md)。
 
-进程正常退出不等于已经发现漏洞。应同时检查最终报告、过程日志、PoC 和 oracle 证据：
+## 源码模块
 
-```shell
-less /root/workspace/linux-vuln-set/PROCESS_LOG.md
-less /root/workspace/linux-vuln-set/candidates/candidate-007/agent-final.md
-less /root/workspace/linux-vuln-set/candidates/candidate-007/report.md
-less /root/workspace/linux-vuln-set/candidates/candidate-007/REPRODUCE.md
-find /root/workspace/linux-vuln-set/candidates/candidate-007 -maxdepth 2 -type f | sort
-rg -n 'ATTACK_RESULT|ESCAPED|confined|inconclusive|negative|ERROR' \
-  /root/workspace/linux-vuln-set/candidates/candidate-007
-```
+`codex-rs/cli/src/` 中与 KScout 漏洞审计相关的模块：
 
-确认漏洞时，重点核对报告中的用户态入口、稳定 oracle、控制实验、重复运行结果和现实
-影响评估；不能只根据模型的最终一句话或 CLI 的退出码判断。
+- [`kernel_vuln.rs`](codex-rs/cli/src/kernel_vuln.rs)：CLI 参数、运行配置、候选调度和结果汇总。
+- [`kernel_vuln_support.rs`](codex-rs/cli/src/kernel_vuln_support.rs)：prompt 渲染、child 命令构造、进度收集和日志输出。
+- [`kernel_vuln_swarm.rs`](codex-rs/cli/src/kernel_vuln_swarm.rs)：peer 轮次、共享论证板、finding 归档和交叉确认门槛。
+- [`kernel_vuln_cleanup.rs`](codex-rs/cli/src/kernel_vuln_cleanup.rs)：校验工作区边界后，仅清理专属 `scratch/` 子目录。
+- `kernel_vuln_rules.rs`、`kernel_vuln_rule_*.rs`：CVE 规则扫描、知识记录、prompt 和报告。
+- `kernel_vuln_dedup.rs`、`kernel_vuln_usage.rs`：finding 索引与耗时/token usage 记录。
 
-### 修改平台代码后重新构建
+## 相关文档
 
-如果修改了 `/root/workspace/codex` 中的 Rust 源码，需要重新构建后再运行；仅修改 Linux
-源码时不需要重新构建 Codex：
+- [Linux 内核漏洞挖掘操作指南](docs/kernel-vuln-hunt.md)
+- [单 agent 实际工作流](docs/kernel-vuln-workflow.md)
+- [Peer swarm 工作流](docs/kernel-vuln-swarm-workflow.md)
+- [CVE/CWE 索引](docs/kernel-cve-cwe-index.md)
+- [CVE 规则知识库](KERNEL_CVE_KNOWLEDGE.json)
+- [贡献指南](docs/contributing.md)
 
-```shell
-cd /root/workspace/codex/codex-rs
-cargo build --locked -p codex-cli --bin codex
-```
-
-使用 `--count 3` 可以运行 3 个相互独立的候选挖掘任务。使用以下命令查看结果：
-
-```shell
-less /root/workspace/linux-vuln-set/PROCESS_LOG.md
-less /root/workspace/linux-vuln-set/candidates/candidate-001/agent-final.md
-find /root/workspace/linux-vuln-set/candidates/candidate-001 -maxdepth 2 -type f
-```
-
-每个候选目录都会保存完整 prompt、执行命令、原始 JSONL/stderr 日志、最终报告、PoC、证据和复现指南。可用 `--extra-prompt` 或 `--extra-prompt-file` 注入额外任务说明；提示词文件入口适合做规则关闭的知识提示对照，实际发送的完整内容会记录在候选 `prompt.md` 中。关于自定义 API 地址、沙箱选项、focus/commit 筛选和输出目录结构，请参阅[完整操作指南](./docs/kernel-vuln-hunt.md)。
-
-## 文档
-
-- [Linux 内核漏洞挖掘操作指南](./docs/kernel-vuln-hunt.md)
-- [按 CWE 整理的 CVE 规则索引](./docs/kernel-cve-cwe-index.md)
-- [结构化 CVE 规则知识库](./KERNEL_CVE_KNOWLEDGE.json)
-- [平台开发与贡献说明](./docs/contributing.md)
-
-本平台基于 Codex CLI 运行时；底层配置和模型接入方式可参考 [Codex 文档](https://developers.openai.com/codex)。
-
-本仓库使用 [Apache-2.0 License](LICENSE)。
+本项目基于 Codex CLI 运行时。模型和 Codex 配置可参考 [Codex 文档](https://developers.openai.com/codex)。本仓库使用 [Apache-2.0 License](LICENSE)。

@@ -6,6 +6,7 @@
 //! count limit. Agent count and rounds are bounded by the CLI to control cost.
 
 use super::RunOptions;
+use super::kernel_vuln_cleanup::cleanup_scratch_directory;
 use super::kernel_vuln_rule_prompt::render_rule_review_prompt;
 use super::kernel_vuln_rules::RuleReview;
 use super::kernel_vuln_support::append_log;
@@ -67,9 +68,19 @@ independent clean setup, or start a new branch. Record each challenge and its
 evidence in `peer-arguments.md` in your workspace. Do not edit another
 participant's files or the shared board.
 
-Your workspace is `{workspace}`. Put your own complete candidate report,
-finding fingerprint, logs, and `PROCESS_LOG.md` there. Do not write the final
-candidate summary at `{candidate_dir}`; the coordinator composes that summary.
+Your persistent artifact workspace is `{workspace}`. Use your dedicated
+temporary scratch directory `{scratch_dir}` for source copies, build trees,
+object files, intermediate kernels, VM disks and snapshots, temporary root
+filesystems/initramfs images, downloads, and caches. Put complete reports,
+finding fingerprints, logs, PoC source, reproduction instructions, and raw
+positive/control evidence in the persistent workspace or finding folders.
+Your process working directory is scratch; relative temporary outputs go there.
+Use the absolute persistent workspace path for reports and evidence.
+Keep only final binaries needed to reproduce a finding. Copy and verify every
+required artifact outside scratch before finishing; do not leave the only copy
+there. Keep report text, logs, and evidence complete; do not shorten or discard
+them to save disk space. Do not write the final candidate summary at
+`{candidate_dir}`; the coordinator composes that summary.
 For every distinct issue you want preserved, create
 `findings/<stable-lead-id>/candidate-report.md` and
 `findings/<stable-lead-id>/finding-fingerprint.md`, plus its PoC, reproduction
@@ -132,6 +143,7 @@ struct PreparedSession {
     agent_name: String,
     round: usize,
     workspace: PathBuf,
+    scratch_dir: PathBuf,
     prompt: String,
     args: Vec<std::ffi::OsString>,
 }
@@ -172,6 +184,7 @@ pub(super) struct SwarmRunRequest<'a, 'b> {
     pub(super) rule_review: Option<&'a RuleReview>,
     pub(super) agent_count: usize,
     pub(super) round_count: usize,
+    pub(super) keep_workspace: bool,
 }
 
 pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<CandidateRunOutcome> {
@@ -188,7 +201,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         .with_context(|| format!("creating swarm workspace root {}", agents_dir.display()))?;
     fs::write(
         agents_dir.join("README.md"),
-        "# Swarm workspaces\n\nEvery agent is a peer. Round 1 starts independently; later rounds receive `SWARM_BOARD.md` and may challenge, reproduce, reject, or branch from earlier leads. No reviewer role is assigned. Each round has isolated agent workspaces and event/usage logs.\n",
+        "# Swarm workspaces\n\nEvery agent is a peer. Round 1 starts independently; later rounds receive `SWARM_BOARD.md` and may challenge, reproduce, reject, or branch from earlier leads. No reviewer role is assigned. Each round has isolated persistent artifact workspaces and event/usage logs. A dedicated `scratch/` directory holds temporary builds and images; it is removed after that round's findings are archived unless `--keep-workspace` is set. Reports, logs, PoCs, and reproduction evidence stay in the persistent workspaces.\n",
     )
     .with_context(|| format!("writing swarm guide in {}", agents_dir.display()))?;
 
@@ -256,15 +269,20 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
     append_log(
         &process_log,
         &format!(
-            "\n#### candidate-{:03} peer swarm\n\n- Peer agents per round: {}\n- Maximum shared-board rounds: {}\n- Scheduled child sessions: {session_count}\n- No permanent reviewer; every participant may discover, argue, reproduce, reject, and branch.\n- Shared argument board: {}\n",
+            "\n#### candidate-{:03} peer swarm\n\n- Peer agents per round: {}\n- Maximum shared-board rounds: {}\n- Scheduled child sessions: {session_count}\n- Keep per-agent scratch workspaces: {}\n- No permanent reviewer; every participant may discover, argue, reproduce, reject, and branch.\n- Shared argument board: {}\n",
             request.candidate_index,
             request.agent_count,
             request.round_count,
+            request.keep_workspace,
             board_path.display()
         ),
     )?;
 
     let mut all_sessions = Vec::with_capacity(session_count);
+    let findings_dir = candidate_dir.join("findings");
+    fs::create_dir_all(&findings_dir)
+        .with_context(|| format!("creating finding archive {}", findings_dir.display()))?;
+    let mut findings = Vec::new();
     let mut records = Vec::with_capacity(session_count);
     let mut all_sessions_succeeded = true;
     let mut last_status = None;
@@ -353,6 +371,14 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
                 round_timer.elapsed().as_secs_f64()
             ),
         )?;
+        findings.extend(archive_findings(
+            &sessions,
+            &findings_dir,
+            request.keep_workspace,
+        )?);
+        for session in &sessions {
+            record_session_scratch_cleanup(session, request.keep_workspace, &process_log)?;
+        }
         let quiescent = sessions.iter().all(session_declares_quiescence);
         records.extend(round_results.into_iter().map(|result| result.usage));
         all_sessions.extend(sessions);
@@ -369,10 +395,6 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         }
     }
 
-    let findings_dir = candidate_dir.join("findings");
-    fs::create_dir_all(&findings_dir)
-        .with_context(|| format!("creating finding archive {}", findings_dir.display()))?;
-    let mut findings = archive_findings(&all_sessions, &findings_dir)?;
     apply_peer_confirmation_gate(&mut findings)?;
     let actual_round_count = all_sessions.len() / request.agent_count;
     let all_sessions_negative = records.iter().all(|record| {
@@ -463,11 +485,13 @@ fn prepare_session(
 ) -> Result<PreparedSession> {
     fs::create_dir_all(workspace)
         .with_context(|| format!("creating agent workspace {}", workspace.display()))?;
+    let scratch_dir = workspace.join("scratch");
     let mut prompt = if let Some(review) = request.rule_review {
         render_rule_review_prompt(
             request.run_options.linux_path,
             request.run_options.output_dir,
             workspace,
+            &scratch_dir,
             request.focus,
             request.commit,
             review,
@@ -477,6 +501,7 @@ fn prepare_session(
             request.run_options.linux_path,
             request.run_options.output_dir,
             workspace,
+            &scratch_dir,
             request.focus,
             request.commit,
         )
@@ -504,12 +529,14 @@ fn prepare_session(
             &request.candidate_dir.display().to_string(),
         )
         .replace("{workspace}", &workspace.display().to_string())
+        .replace("{scratch_dir}", &scratch_dir.display().to_string())
         .replace("{board_path}", &board_path.display().to_string());
     prompt.push_str(&swarm_instructions);
 
     let args = build_child_args(
         request.root_config_overrides,
         request.run_options,
+        &scratch_dir,
         workspace,
         &[request.candidate_dir, request.run_options.output_dir],
     );
@@ -523,10 +550,12 @@ fn prepare_session(
     fs::write(
         workspace.join("run-metadata.md"),
         format!(
-            "# Swarm session metadata\n\n- role: equal peer researcher\n- participant: {agent_name}\n- round: {round}/{}\n- audit group: candidate-{:03}\n- workspace: {}\n- Linux source: {}\n- model: {}\n- API key variable: {} (value redacted)\n- API base URL: {}\n- sandbox: {}\n- prompt: prompt.md\n- command: command.txt\n- event log: agent-events.jsonl\n- stderr log: agent-stderr.log\n- usage summary: usage.json\n",
+            "# Swarm session metadata\n\n- role: equal peer researcher\n- participant: {agent_name}\n- round: {round}/{}\n- audit group: candidate-{:03}\n- persistent workspace: {}\n- scratch directory: {}\n- keep scratch after run: {}\n- Linux source: {}\n- model: {}\n- API key variable: {} (value redacted)\n- API base URL: {}\n- sandbox: {}\n- prompt: prompt.md\n- command: command.txt\n- event log: agent-events.jsonl\n- stderr log: agent-stderr.log\n- usage summary: usage.json\n",
             request.round_count,
             request.candidate_index,
             workspace.display(),
+            scratch_dir.display(),
+            request.keep_workspace,
             request.run_options.linux_path.display(),
             request.run_options.model.unwrap_or("config/default"),
             request.run_options.api_key_env,
@@ -544,6 +573,7 @@ fn prepare_session(
         agent_name: agent_name.to_string(),
         round,
         workspace: workspace.to_path_buf(),
+        scratch_dir,
         prompt,
         args,
     })
@@ -558,7 +588,7 @@ async fn run_prepared_session_timed(
     let result = run_agent(
         request.executable,
         &session.args,
-        &session.workspace,
+        &session.scratch_dir,
         &session.workspace,
         request.api_key,
         &session.prompt,
@@ -571,6 +601,36 @@ async fn run_prepared_session_timed(
         finished_at: Utc::now(),
         elapsed_seconds: timer.elapsed().as_secs_f64(),
     }
+}
+
+fn record_session_scratch_cleanup(
+    session: &PreparedSession,
+    keep_workspace: bool,
+    process_log: &Path,
+) -> Result<()> {
+    let cleanup_note = if keep_workspace {
+        format!(
+            "retained by --keep-workspace: {}",
+            session.scratch_dir.display()
+        )
+    } else {
+        match cleanup_scratch_directory(&session.workspace, &session.scratch_dir) {
+            Ok(()) => format!("removed {}", session.scratch_dir.display()),
+            Err(error) => format!(
+                "failed to remove {}: {error:#}",
+                session.scratch_dir.display()
+            ),
+        }
+    };
+    fs::write(
+        session.workspace.join("workspace-cleanup.md"),
+        format!("Scratch workspace cleanup: {cleanup_note}\n"),
+    )
+    .with_context(|| format!("writing cleanup record in {}", session.workspace.display()))?;
+    append_log(
+        process_log,
+        &format!("- {} scratch cleanup: {cleanup_note}\n", session.name),
+    )
 }
 
 fn complete_session(
@@ -692,6 +752,7 @@ fn read_bounded_file(path: &Path, max_chars: usize) -> String {
 fn archive_findings(
     sessions: &[PreparedSession],
     findings_dir: &Path,
+    keep_workspace: bool,
 ) -> Result<Vec<ArchivedFinding>> {
     let mut archived = Vec::new();
     for session in sessions {
@@ -704,7 +765,13 @@ fn archive_findings(
             entries.sort_by_key(std::fs::DirEntry::file_name);
             for entry in entries {
                 let source = entry.path();
-                archive_finding_folder(session, &source, findings_dir, &mut archived)?;
+                archive_finding_folder(
+                    session,
+                    &source,
+                    findings_dir,
+                    keep_workspace,
+                    &mut archived,
+                )?;
             }
         }
 
@@ -729,7 +796,7 @@ fn archive_findings(
                 .with_context(|| format!("copying {}", root_report.display()))?;
             fs::copy(&root_fingerprint, dest.join("finding-fingerprint.md"))
                 .with_context(|| format!("copying {}", root_fingerprint.display()))?;
-            write_evidence_pointer(&dest, &source)?;
+            write_evidence_pointer(&dest, &source, keep_workspace)?;
             archived.push(archived_finding(
                 &session.agent_name,
                 dest,
@@ -744,6 +811,7 @@ fn archive_finding_folder(
     session: &PreparedSession,
     source: &Path,
     findings_dir: &Path,
+    keep_workspace: bool,
     archived: &mut Vec<ArchivedFinding>,
 ) -> Result<()> {
     let fingerprint = source.join("finding-fingerprint.md");
@@ -767,7 +835,7 @@ fn archive_finding_folder(
         &format!("{}-r{:02}-{}", folder, session.round, session.agent_name),
     );
     copy_tree(source, &dest)?;
-    write_evidence_pointer(&dest, source)?;
+    write_evidence_pointer(&dest, &session.workspace, keep_workspace)?;
     archived.push(archived_finding(&session.agent_name, dest, &fingerprint)?);
     Ok(())
 }
@@ -792,12 +860,17 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_evidence_pointer(destination: &Path, source: &Path) -> Result<()> {
+fn write_evidence_pointer(destination: &Path, source: &Path, keep_workspace: bool) -> Result<()> {
     fs::write(
         destination.join("SWARM_EVIDENCE_SOURCE.md"),
         format!(
-            "This finding was submitted by a swarm participant. Its original workspace, event logs, raw experiments, and any evidence not duplicated here remain at `{}`.\n",
-            source.display()
+            "This finding was submitted by a swarm participant. Its persistent workspace and event logs remain at `{}`. Scratch is {}. Required reports and evidence must be stored outside scratch; finding files copied into this archive remain available here.\n",
+            source.display(),
+            if keep_workspace {
+                format!("retained at `{}`", source.join("scratch").display())
+            } else {
+                "removed after this round's finding archive was created".to_string()
+            },
         ),
     )
     .with_context(|| format!("writing evidence pointer in {}", destination.display()))
