@@ -232,7 +232,7 @@ pub(super) fn read_finding_outcome(fingerprint_path: &Path) -> Option<String> {
         if !key.trim().trim_matches('*').eq_ignore_ascii_case("outcome") {
             return None;
         }
-        let value = value.trim().trim_matches('*');
+        let value = value.trim().trim_matches(['*', '`', ' ']);
         (!value.is_empty()).then(|| value.to_string())
     })
 }

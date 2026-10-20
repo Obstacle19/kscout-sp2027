@@ -35,6 +35,8 @@ mod kernel_vuln_rules;
 mod kernel_vuln_support;
 #[path = "kernel_vuln_swarm.rs"]
 mod kernel_vuln_swarm;
+#[path = "kernel_vuln_swarm_consensus.rs"]
+mod kernel_vuln_swarm_consensus;
 #[path = "kernel_vuln_usage.rs"]
 mod kernel_vuln_usage;
 

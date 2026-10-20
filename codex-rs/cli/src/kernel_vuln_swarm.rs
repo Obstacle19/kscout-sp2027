@@ -15,6 +15,10 @@ use super::kernel_vuln_support::format_command_for_file;
 use super::kernel_vuln_support::render_prompt;
 use super::kernel_vuln_support::run_agent;
 use super::kernel_vuln_support::sandbox_name;
+use super::kernel_vuln_swarm_consensus::ArchivedFinding;
+use super::kernel_vuln_swarm_consensus::apply_peer_confirmation_gate;
+use super::kernel_vuln_swarm_consensus::archived_finding;
+use super::kernel_vuln_swarm_consensus::group_findings;
 use super::kernel_vuln_usage::CandidateUsageRecord;
 use super::kernel_vuln_usage::TokenUsageSummary;
 use super::kernel_vuln_usage::aggregate_token_usage;
@@ -28,7 +32,6 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_utils_cli::CliConfigOverrides;
 use futures::future::join_all;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
@@ -86,15 +89,22 @@ For every distinct issue you want preserved, create
 `findings/<stable-lead-id>/finding-fingerprint.md`, plus its PoC, reproduction
 steps, controls, and raw evidence. There is no finding-count cap. Keep separate
 root causes in separate folders, and reuse the same stable lead ID when
-discussing the same root cause in a later round. Include the exact lead ID,
+discussing the same root cause in a later round. Start each finding fingerprint
+with machine-readable `Outcome: confirmed|plausible|negative|duplicate` and
+`Lead ID: <stable-id>` fields. In the candidate report, label `Local
+reproduction:` and `Security impact:` separately. Include the exact lead ID,
 status, commands, clean setup, oracle, and control in `peer-arguments.md`.
 
-For a finding marked `confirmed`, include the deterministic positive result,
-the close negative control, and a clean repeat. To raise a finding from
-`plausible` to swarm-level `confirmed`, another distinct participant must
-independently reproduce the same root cause and oracle. A participant may
-disagree; record the disagreement and leave the result plausible or
-inconclusive when the evidence does not resolve it.
+In each finding fingerprint, `Outcome: confirmed` means this participant has
+locally reproduced the behavior with a deterministic positive, a close
+negative control, and a clean repeat. Use `plausible` when the behavior itself
+has not been reproduced. Do not downgrade a locally reproduced finding merely
+because no peer has checked it yet; the coordinator records swarm consensus
+separately after grouping participants by stable Lead ID. In the report, assess
+security impact separately from reproduction status: a reproducible API or
+correctness defect is not automatically a security vulnerability. A participant
+may disagree; record the disagreement and leave the security impact unresolved
+when the evidence does not resolve it.
 
 At the end, write `SWARM_UPDATE.md` with the exact lead IDs discovered,
 challenged, independently confirmed, rejected, unresolved, and any concrete
@@ -159,14 +169,6 @@ struct TimedSessionResult {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     elapsed_seconds: f64,
-}
-
-struct ArchivedFinding {
-    agent_name: String,
-    path: PathBuf,
-    outcome: String,
-    title: String,
-    root_cause: String,
 }
 
 pub(super) struct SwarmRunRequest<'a, 'b> {
@@ -801,6 +803,7 @@ fn archive_findings(
                 &session.agent_name,
                 dest,
                 &root_fingerprint,
+                &root_report,
             )?);
         }
     }
@@ -836,7 +839,12 @@ fn archive_finding_folder(
     );
     copy_tree(source, &dest)?;
     write_evidence_pointer(&dest, &session.workspace, keep_workspace)?;
-    archived.push(archived_finding(&session.agent_name, dest, &fingerprint)?);
+    archived.push(archived_finding(
+        &session.agent_name,
+        dest,
+        &fingerprint,
+        &report,
+    )?);
     Ok(())
 }
 
@@ -876,129 +884,6 @@ fn write_evidence_pointer(destination: &Path, source: &Path, keep_workspace: boo
     .with_context(|| format!("writing evidence pointer in {}", destination.display()))
 }
 
-fn archived_finding(
-    agent_name: &str,
-    path: PathBuf,
-    fingerprint: &Path,
-) -> Result<ArchivedFinding> {
-    let contents = fs::read_to_string(fingerprint)
-        .with_context(|| format!("reading finding fingerprint {}", fingerprint.display()))?;
-    Ok(ArchivedFinding {
-        agent_name: agent_name.to_string(),
-        path,
-        outcome: read_finding_outcome(fingerprint).unwrap_or_default(),
-        title: fingerprint_field(&contents, "Title"),
-        root_cause: fingerprint_field(&contents, "Root cause/invariant"),
-    })
-}
-
-fn apply_peer_confirmation_gate(findings: &mut [ArchivedFinding]) -> Result<()> {
-    let mut confirming_agents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for finding in findings
-        .iter()
-        .filter(|finding| finding.outcome.eq_ignore_ascii_case("confirmed"))
-    {
-        let key = claim_key(&finding.title, &finding.root_cause);
-        if !key.is_empty() {
-            confirming_agents
-                .entry(key)
-                .or_default()
-                .insert(finding.agent_name.clone());
-        }
-    }
-    for finding in findings.iter_mut() {
-        if !finding.outcome.eq_ignore_ascii_case("confirmed") {
-            continue;
-        }
-        let key = claim_key(&finding.title, &finding.root_cause);
-        let peers = confirming_agents.get(&key).map_or(0, BTreeSet::len);
-        if peers >= 2 {
-            continue;
-        }
-        let fingerprint_path = finding.path.join("finding-fingerprint.md");
-        let mut fingerprint = fs::read_to_string(&fingerprint_path)
-            .with_context(|| format!("reading {}", fingerprint_path.display()))?;
-        fingerprint = replace_first_outcome(&fingerprint, "plausible");
-        fingerprint.push_str(
-            "\nSwarm confirmation gate: downgraded to plausible because no second distinct participant independently reported the same title and root cause as confirmed. Review the original workspace and peer arguments before treating this as confirmed.\n",
-        );
-        fs::write(&fingerprint_path, fingerprint)
-            .with_context(|| format!("updating {}", fingerprint_path.display()))?;
-        finding.outcome = "plausible".to_string();
-    }
-    Ok(())
-}
-
-fn claim_key(title: &str, root_cause: &str) -> String {
-    let normalize = |value: &str| {
-        value
-            .chars()
-            .filter(|character| character.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
-    let title = normalize(title);
-    let root_cause = normalize(root_cause);
-    if title.is_empty() || root_cause.is_empty() {
-        String::new()
-    } else {
-        format!("{title}:{root_cause}")
-    }
-}
-
-fn group_findings(findings: &[ArchivedFinding]) -> Vec<Vec<&ArchivedFinding>> {
-    let mut groups: BTreeMap<String, Vec<&ArchivedFinding>> = BTreeMap::new();
-    for finding in findings {
-        let key = claim_key(&finding.title, &finding.root_cause);
-        let key = if key.is_empty() {
-            finding.path.to_string_lossy().into_owned()
-        } else {
-            key
-        };
-        groups.entry(key).or_default().push(finding);
-    }
-    groups.into_values().collect()
-}
-
-fn fingerprint_field(fingerprint: &str, wanted: &str) -> String {
-    fingerprint
-        .lines()
-        .find_map(|line| {
-            let (key, value) = line
-                .trim()
-                .trim_start_matches(['-', '*', ' '])
-                .split_once(':')?;
-            key.trim()
-                .trim_matches('*')
-                .eq_ignore_ascii_case(wanted)
-                .then(|| value.trim().to_string())
-        })
-        .unwrap_or_default()
-}
-
-fn replace_first_outcome(fingerprint: &str, outcome: &str) -> String {
-    let mut replaced = false;
-    fingerprint
-        .lines()
-        .map(|line| {
-            if !replaced
-                && let Some((key, _)) = line.split_once(':')
-                && key
-                    .trim()
-                    .trim_start_matches(['-', '*'])
-                    .trim()
-                    .eq_ignore_ascii_case("Outcome")
-            {
-                replaced = true;
-                return format!("Outcome: {outcome}");
-            }
-            line.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
-}
-
 fn write_candidate_summary(
     candidate_dir: &Path,
     findings: &[ArchivedFinding],
@@ -1010,7 +895,7 @@ fn write_candidate_summary(
 ) -> Result<()> {
     let groups = group_findings(findings);
     let mut report = String::from(
-        "# Swarm candidate report\n\nThis report summarizes the peer swarm. Each participant's full prompt, source audit, experiments, event stream, stderr, and usage are preserved under `agents/`. Every positive or plausible submission is archived under `findings/`; repeated submissions with matching titles and root causes are grouped here while their separate evidence remains available. No finding count limit is applied.\n\n",
+        "# Swarm candidate report\n\nThis report summarizes the peer swarm. Each participant's full prompt, source audit, experiments, event stream, stderr, and usage are preserved under `agents/`. Every positive or plausible submission is archived under `findings/`; submissions with the same stable Lead ID are grouped here, with normalized title and root-cause matching as a legacy fallback. Their separate evidence remains available. No finding count limit is applied.\n\n",
     );
     if groups.is_empty() {
         report.push_str("No participant submitted a complete positive or plausible finding folder. Read the round board and agent workspaces for coverage and rejected leads.\n");
@@ -1020,7 +905,7 @@ fn write_candidate_summary(
             let finding = group[0];
             let outcome = if group
                 .iter()
-                .any(|finding| finding.outcome.eq_ignore_ascii_case("confirmed"))
+                .any(|finding| finding.swarm_outcome.eq_ignore_ascii_case("confirmed"))
             {
                 "confirmed"
             } else {
@@ -1056,14 +941,14 @@ fn write_candidate_summary(
                 outcome,
             ));
         }
-        report.push_str("\nA `confirmed` status requires two distinct participants to report matching titles and root causes as confirmed. Otherwise the coordinator downgrades that archive to `plausible`; inspect original evidence and disagreements before relying on any claim.\n");
+        report.push_str("\nA swarm-level `confirmed` status requires local `confirmed` results from at least two distinct participants with the same stable Lead ID (or matching normalized title and root cause when the fingerprint has no Lead ID). The original participant outcome is preserved in each archived fingerprint; the coordinator records swarm consensus separately.\n");
     }
     fs::write(candidate_dir.join("candidate-report.md"), &report)
         .with_context(|| format!("writing swarm report in {}", candidate_dir.display()))?;
 
     let outcome = if findings
         .iter()
-        .any(|finding| finding.outcome.eq_ignore_ascii_case("confirmed"))
+        .any(|finding| finding.swarm_outcome.eq_ignore_ascii_case("confirmed"))
     {
         "confirmed"
     } else if !findings.is_empty() {
