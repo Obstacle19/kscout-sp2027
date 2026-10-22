@@ -37,11 +37,12 @@ mod kernel_vuln_support;
 mod kernel_vuln_swarm;
 #[path = "kernel_vuln_swarm_consensus.rs"]
 mod kernel_vuln_swarm_consensus;
+#[path = "kernel_vuln_swarm_planner.rs"]
+mod kernel_vuln_swarm_planner;
 #[path = "kernel_vuln_usage.rs"]
 mod kernel_vuln_usage;
 
 use self::kernel_vuln_cleanup::cleanup_scratch_directory;
-use self::kernel_vuln_dedup::refresh_finding_index;
 use self::kernel_vuln_rule_prompt::render_rule_review_prompt;
 use self::kernel_vuln_rule_report::render_rule_scan_report;
 use self::kernel_vuln_rules::cve_rule_focus_is_supported;
@@ -164,6 +165,11 @@ pub(crate) struct KernelVulnCommand {
     /// Directory where all run artifacts and candidate folders are stored.
     #[arg(long = "output-dir", value_name = "DIR", default_value = DEFAULT_OUTPUT_DIR)]
     output_dir: PathBuf,
+
+    /// Prior FINDING_INDEX.md file or output directory; may be repeated.
+    /// Imported entries are used only to exclude duplicate root causes.
+    #[arg(long = "prior-finding-index", value_name = "PATH")]
+    prior_finding_indexes: Vec<PathBuf>,
 
     /// Maximum number of model review passes. In CVE-rule mode, each pass
     /// reviews one grouped CVE rule family instead of doing open-ended search.
@@ -303,6 +309,7 @@ pub(crate) async fn run(
     let KernelVulnCommand {
         linux_path,
         output_dir,
+        prior_finding_indexes,
         count,
         swarm,
         swarm_agents,
@@ -356,6 +363,7 @@ pub(crate) async fn run(
     validate_api_base_url(api_base_url.as_deref())?;
 
     let linux_path = canonicalize_directory(&linux_path, "Linux source")?;
+    let prior_finding_indexes = resolve_prior_finding_indexes(&prior_finding_indexes)?;
     let output_dir = prepare_output_directory(&output_dir, &linux_path)?;
     let rule_scan = if use_cve_rules {
         Some(scan_cve_rules(&linux_path, focus.as_deref(), &cve_rules)?)
@@ -377,7 +385,7 @@ pub(crate) async fn run(
     };
     ensure!(
         !swarm || scheduled_child_sessions <= MAX_SWARM_SESSIONS_PER_RUN,
-        "swarm run would schedule {scheduled_child_sessions} child sessions; reduce --count, --swarm-agents, or --swarm-rounds (maximum {MAX_SWARM_SESSIONS_PER_RUN} per run)"
+        "swarm run could use up to {scheduled_child_sessions} child sessions before early stopping; reduce --count, --swarm-agents, or --swarm-rounds (maximum {MAX_SWARM_SESSIONS_PER_RUN} per run)"
     );
 
     let candidates_dir = output_dir.join("candidates");
@@ -420,7 +428,11 @@ pub(crate) async fn run(
         keep_workspace,
     };
     initialize_output_files(&run_options, &process_log)?;
-    refresh_finding_index(&candidates_dir, &finding_index)?;
+    kernel_vuln_dedup::refresh_finding_index_with_prior(
+        &candidates_dir,
+        &finding_index,
+        &prior_finding_indexes,
+    )?;
 
     let run_started = Utc::now();
     let started_at = run_started.to_rfc3339();
@@ -452,9 +464,9 @@ pub(crate) async fn run(
              - Pass mode: {}\n\
              - Requested count: {count}\n\
              - Rule-family reviews scheduled: {rule_review_count}\n\
-             - Scheduled child sessions: {scheduled_child_sessions}\n\
+             - Maximum possible child sessions: {scheduled_child_sessions}\n\
              - Swarm audit groups: {swarm}\n\
-             - Swarm agents per round: {swarm_agents}\n\
+             - Maximum parallel swarm agents per round: {swarm_agents}\n\
              - Swarm maximum argument rounds: {swarm_rounds}\n\
              - API key variable: {api_key_env} (value redacted)\n\
              - API base URL: {}\n\
@@ -463,6 +475,7 @@ pub(crate) async fn run(
              - Additional prompt: {custom_prompt_source}\n\
              - Commit scope: {}\n\
              - Duplicate exclusion index: {}\n\
+             - Imported prior finding indexes: {}\n\
              - Sandbox: {}\n\
              - Dangerous bypass: {dangerously_bypass_approvals_and_sandbox}\n\
              - Live progress: {show_progress}\n\
@@ -480,6 +493,15 @@ pub(crate) async fn run(
             focus.as_deref().unwrap_or("none"),
             commit.as_deref().unwrap_or("current tree/history"),
             finding_index.display(),
+            if prior_finding_indexes.is_empty() {
+                "none".to_string()
+            } else {
+                prior_finding_indexes
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
             sandbox_name(sandbox),
         ),
     )?;
@@ -595,7 +617,7 @@ pub(crate) async fn run(
                  - keep scratch after run: {}\n\
                  - rule mode: {}\n\
                  - swarm mode: {swarm}\n\
-                 - swarm agents per round: {swarm_agents}\n\
+                 - maximum parallel swarm agents per round: {swarm_agents}\n\
                  - swarm maximum argument rounds: {swarm_rounds}\n\
                  - rule review bundle: {}\n\
                  - additional prompt: {}\n\
@@ -760,7 +782,11 @@ pub(crate) async fn run(
         persist_candidate_usage(&usage_record, &candidate_dir, &output_dir)?;
         append_log(&process_log, &usage_record.markdown_summary())?;
         usage_records.push(usage_record);
-        refresh_finding_index(&candidates_dir, &finding_index)?;
+        kernel_vuln_dedup::refresh_finding_index_with_prior(
+            &candidates_dir,
+            &finding_index,
+            &prior_finding_indexes,
+        )?;
 
         match outcome.child_result.as_str() {
             "success" => {
@@ -849,6 +875,26 @@ fn scheduled_pass_counts(
     } else {
         (requested_count as usize, 0)
     }
+}
+
+fn resolve_prior_finding_indexes(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    paths
+        .iter()
+        .map(|path| {
+            let index_path = if path.is_dir() {
+                path.join(FINDING_INDEX_FILE_NAME)
+            } else {
+                path.clone()
+            };
+            ensure!(
+                index_path.is_file(),
+                "prior finding index does not exist or is not a file: {}",
+                index_path.display()
+            );
+            fs::canonicalize(&index_path)
+                .with_context(|| format!("resolving prior finding index {}", index_path.display()))
+        })
+        .collect()
 }
 
 #[cfg(test)]

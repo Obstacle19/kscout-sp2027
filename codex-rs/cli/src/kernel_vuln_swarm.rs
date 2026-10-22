@@ -16,9 +16,17 @@ use super::kernel_vuln_support::render_prompt;
 use super::kernel_vuln_support::run_agent;
 use super::kernel_vuln_support::sandbox_name;
 use super::kernel_vuln_swarm_consensus::ArchivedFinding;
+use super::kernel_vuln_swarm_consensus::SecurityImpactClass;
 use super::kernel_vuln_swarm_consensus::apply_peer_confirmation_gate;
 use super::kernel_vuln_swarm_consensus::archived_finding;
 use super::kernel_vuln_swarm_consensus::group_findings;
+use super::kernel_vuln_swarm_consensus::triage_leads;
+use super::kernel_vuln_swarm_planner::LeadRejections;
+use super::kernel_vuln_swarm_planner::PeerAssignment;
+use super::kernel_vuln_swarm_planner::PeerTask;
+use super::kernel_vuln_swarm_planner::argument_round;
+use super::kernel_vuln_swarm_planner::has_actionable_leads;
+use super::kernel_vuln_swarm_planner::initial_round;
 use super::kernel_vuln_usage::CandidateUsageRecord;
 use super::kernel_vuln_usage::TokenUsageSummary;
 use super::kernel_vuln_usage::aggregate_token_usage;
@@ -71,6 +79,14 @@ independent clean setup, or start a new branch. Record each challenge and its
 evidence in `peer-arguments.md` in your workspace. Do not edit another
 participant's files or the shared board.
 
+The coordinator assigns later-round sessions from the unresolved leads. If you
+receive an assigned Lead ID, investigate that exact lead first: independently
+reproduce or falsify it, verify realistic attacker preconditions and the
+security boundary involved, and state what evidence would change your view.
+Do not assume a reproducible behavior is a security vulnerability. If your task
+is fresh discovery, choose an unexamined code area and avoid repeating the
+assigned leads.
+
 Your persistent artifact workspace is `{workspace}`. Use your dedicated
 temporary scratch directory `{scratch_dir}` for source copies, build trees,
 object files, intermediate kernels, VM disks and snapshots, temporary root
@@ -92,8 +108,12 @@ root causes in separate folders, and reuse the same stable lead ID when
 discussing the same root cause in a later round. Start each finding fingerprint
 with machine-readable `Outcome: confirmed|plausible|negative|duplicate` and
 `Lead ID: <stable-id>` fields. In the candidate report, label `Local
-reproduction:` and `Security impact:` separately. Include the exact lead ID,
-status, commands, clean setup, oracle, and control in `peer-arguments.md`.
+reproduction:` and `Security impact:` separately. Also include
+`Security impact class: security-relevant | correctness-only | unresolved`.
+Choose exactly one class value. Use `security-relevant` only when you identify a concrete attacker capability
+and security boundary or protected asset; otherwise use `correctness-only` or
+`unresolved`. Include the exact lead ID, status, commands, clean setup, oracle,
+and control in `peer-arguments.md`.
 
 In each finding fingerprint, `Outcome: confirmed` means this participant has
 locally reproduced the behavior with a deterministic positive, a close
@@ -111,6 +131,16 @@ challenged, independently confirmed, rejected, unresolved, and any concrete
 follow-up task another participant should take. State `Round status: quiescent`
 only if no actionable lead or evidence task remains. Do not hide failed
 experiments, incomplete work, or uncertainty.
+
+For a coordinator-assigned challenge, also include these machine-readable lines
+in `SWARM_UPDATE.md`:
+- `Assigned Lead ID: <stable-id>`
+- `Lead challenge disposition: upheld | rejected | unresolved`
+- `Independent reproduction: confirmed | failed | not-run`
+Use `rejected` only when source tracing or a
+controlled experiment falsifies the lead's central claim; otherwise use
+`unresolved`. Two distinct peers must reject the same lead before the
+coordinator stops scheduling further challenges for it.
 "#;
 
 pub(super) struct CandidateRunOutcome {
@@ -203,7 +233,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         .with_context(|| format!("creating swarm workspace root {}", agents_dir.display()))?;
     fs::write(
         agents_dir.join("README.md"),
-        "# Swarm workspaces\n\nEvery agent is a peer. Round 1 starts independently; later rounds receive `SWARM_BOARD.md` and may challenge, reproduce, reject, or branch from earlier leads. No reviewer role is assigned. Each round has isolated persistent artifact workspaces and event/usage logs. A dedicated `scratch/` directory holds temporary builds and images; it is removed after that round's findings are archived unless `--keep-workspace` is set. Reports, logs, PoCs, and reproduction evidence stay in the persistent workspaces.\n",
+        "# Swarm workspaces\n\nEvery agent is a peer. Round 1 starts independently; later rounds receive `SWARM_BOARD.md` and are dynamically assigned to unresolved leads or fresh discovery. No reviewer role is assigned. Follow-up sessions use new participant IDs. Each round has isolated persistent artifact workspaces and event/usage logs. A dedicated `scratch/` directory holds temporary builds and images; it is removed after that round's findings are archived unless `--keep-workspace` is set. Reports, logs, PoCs, and reproduction evidence stay in the persistent workspaces.\n",
     )
     .with_context(|| format!("writing swarm guide in {}", agents_dir.display()))?;
 
@@ -220,7 +250,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
     fs::write(
         candidate_dir.join("prompt.md"),
         format!(
-            "# Peer swarm audit\n\n`--count 1` schedules one swarm group with {} peer agents and up to {} shared-board rounds. The first round discovers independently; later rounds argue, reproduce, reject, or branch. There is no finding count limit. Individual prompts and evidence are in `agents/`.\n\nShared board: {}\n",
+            "# Peer swarm audit\n\n`--count 1` schedules one swarm group with up to {} parallel peers per round and up to {} shared-board rounds. The first round discovers independently; later rounds dynamically assign new peers to unresolved leads while keeping a fresh-discovery slot. There is no finding count limit, and actual session count may be lower than the maximum. Individual prompts and evidence are in `agents/`.\n\nShared board: {}\n",
             request.agent_count,
             request.round_count,
             board_path.display()
@@ -233,19 +263,25 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
     )
     .with_context(|| format!("writing swarm command manifest in {}", candidate_dir.display()))?;
     let process_log = request.run_options.output_dir.join("PROCESS_LOG.md");
-    let session_count = request.agent_count.saturating_mul(request.round_count);
+    let maximum_session_count = request.agent_count.saturating_mul(request.round_count);
     if request.dry_run {
+        let mut next_participant = 1;
         for round in 1..=request.round_count {
-            for agent_number in 1..=request.agent_count {
-                let agent_name = format!("agent-{agent_number:02}");
+            for _ in 0..request.agent_count {
+                let assignment = PeerAssignment {
+                    agent_name: format!("agent-{next_participant:02}"),
+                    task: PeerTask::Discovery,
+                };
+                next_participant += 1;
+                let agent_name = &assignment.agent_name;
                 let session_name = format!("round-{round:02}-{agent_name}");
                 let workspace = agents_dir
                     .join(format!("round-{round:02}"))
-                    .join(&agent_name);
+                    .join(agent_name);
                 prepare_session(
                     &request,
                     &session_name,
-                    &agent_name,
+                    &assignment,
                     round,
                     &workspace,
                     &board_path,
@@ -255,7 +291,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         append_log(
             &process_log,
             &format!(
-                "\n#### candidate-{:03} peer swarm dry-run\n\n- Prepared {session_count} session prompts and commands for {} agents across up to {} rounds; no child was started.\n",
+                "\n#### candidate-{:03} peer swarm dry-run\n\n- Prepared the maximum layout of {maximum_session_count} session prompts and commands, with up to {} parallel peers across {} rounds. Lead-specific follow-ups are selected from runtime evidence; this dry run shows discovery-template prompts for those slots. No child was started.\n",
                 request.candidate_index, request.agent_count, request.round_count
             ),
         )?;
@@ -271,7 +307,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
     append_log(
         &process_log,
         &format!(
-            "\n#### candidate-{:03} peer swarm\n\n- Peer agents per round: {}\n- Maximum shared-board rounds: {}\n- Scheduled child sessions: {session_count}\n- Keep per-agent scratch workspaces: {}\n- No permanent reviewer; every participant may discover, argue, reproduce, reject, and branch.\n- Shared argument board: {}\n",
+            "\n#### candidate-{:03} peer swarm\n\n- Maximum parallel peers per round: {}\n- Maximum shared-board rounds: {}\n- Maximum possible child sessions: {maximum_session_count}; follow-up rounds are dynamically staffed and may stop early.\n- Keep per-agent scratch workspaces: {}\n- No permanent reviewer; every participant may discover, argue, reproduce, reject, and branch.\n- Shared argument board: {}\n",
             request.candidate_index,
             request.agent_count,
             request.round_count,
@@ -280,46 +316,77 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         ),
     )?;
 
-    let mut all_sessions = Vec::with_capacity(session_count);
+    let mut all_sessions = Vec::with_capacity(maximum_session_count);
     let findings_dir = candidate_dir.join("findings");
     fs::create_dir_all(&findings_dir)
         .with_context(|| format!("creating finding archive {}", findings_dir.display()))?;
     let mut findings = Vec::new();
-    let mut records = Vec::with_capacity(session_count);
+    let mut records = Vec::with_capacity(maximum_session_count);
     let mut all_sessions_succeeded = true;
     let mut last_status = None;
     let mut failing_status = None;
     let mut any_spawn_failure = false;
     let mut errors = Vec::new();
+    let mut rejected_leads = LeadRejections::new();
+    let mut next_participant = 1;
+    let mut completed_round_count = 0;
 
     for round in 1..=request.round_count {
-        let sessions = (1..=request.agent_count)
-            .map(|agent_number| {
-                let agent_name = format!("agent-{agent_number:02}");
+        let assignments = if round == 1 {
+            initial_round(request.agent_count)
+        } else {
+            argument_round(
+                &findings,
+                &rejected_leads,
+                request.agent_count,
+                next_participant,
+            )
+        };
+        let sessions = assignments
+            .iter()
+            .map(|assignment| {
+                let agent_name = &assignment.agent_name;
                 let session_name = format!("round-{round:02}-{agent_name}");
                 let workspace = agents_dir
                     .join(format!("round-{round:02}"))
-                    .join(&agent_name);
+                    .join(agent_name);
                 prepare_session(
                     &request,
                     &session_name,
-                    &agent_name,
+                    assignment,
                     round,
                     &workspace,
                     &board_path,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        next_participant += assignments.len();
+        let task_summary = assignments
+            .iter()
+            .map(|assignment| match &assignment.task {
+                PeerTask::Discovery => format!("{}: fresh discovery", assignment.agent_name),
+                PeerTask::Followup(lead) => {
+                    format!(
+                        "{}: challenge Lead ID {}",
+                        assignment.agent_name, lead.lead_id
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
 
         println!(
             "[kernel-vuln] candidate {:03}: swarm round {round}/{} starting {} peer agents in parallel",
-            request.candidate_index, request.round_count, request.agent_count
+            request.candidate_index,
+            request.round_count,
+            sessions.len()
         );
         append_log(
             &process_log,
             &format!(
-                "\n- Round {round}/{} started; {} agents running in parallel.\n",
-                request.round_count, request.agent_count
+                "\n- Round {round}/{} started; {} agents running in parallel. Tasks: {task_summary}.\n",
+                request.round_count,
+                sessions.len()
             ),
         )?;
 
@@ -381,24 +448,47 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         for session in &sessions {
             record_session_scratch_cleanup(session, request.keep_workspace, &process_log)?;
         }
+        for (assignment, session) in assignments.iter().zip(&sessions) {
+            let PeerTask::Followup(lead) = &assignment.task else {
+                continue;
+            };
+            if session_rejects_assigned_lead(session, &lead.lead_id) {
+                let peers = rejected_leads.entry(lead.key.clone()).or_default();
+                if peers.insert(assignment.agent_name.clone()) {
+                    append_log(
+                        &process_log,
+                        &format!(
+                            "- {} rejected assigned Lead ID {}; {} independent peer rejection(s) recorded.\n",
+                            assignment.agent_name,
+                            lead.lead_id,
+                            peers.len()
+                        ),
+                    )?;
+                }
+            }
+        }
         let quiescent = sessions.iter().all(session_declares_quiescence);
         records.extend(round_results.into_iter().map(|result| result.usage));
         all_sessions.extend(sessions);
-        if quiescent && round < request.round_count {
+        completed_round_count = round;
+        let pending_leads = has_actionable_leads(&findings, &rejected_leads);
+        if quiescent && !pending_leads && round < request.round_count {
             println!(
                 "[kernel-vuln] candidate {:03}: swarm reached quiescence after round {round}; stopping early",
                 request.candidate_index
             );
             append_log(
                 &process_log,
-                &format!("- All peers declared round {round} quiescent; later rounds skipped.\n"),
+                &format!(
+                    "- All peers declared round {round} quiescent and no lead needs an independent reproduction or security-impact assessment; later rounds skipped.\n"
+                ),
             )?;
             break;
         }
     }
 
     apply_peer_confirmation_gate(&mut findings)?;
-    let actual_round_count = all_sessions.len() / request.agent_count;
+    let actual_session_count = all_sessions.len();
     let all_sessions_negative = records.iter().all(|record| {
         record
             .finding_outcome
@@ -414,11 +504,15 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
     write_candidate_summary(
         candidate_dir,
         &findings,
-        all_sessions_succeeded,
-        all_sessions_negative,
-        all_sessions_duplicate,
-        request.agent_count,
-        actual_round_count,
+        CandidateSummaryContext {
+            all_sessions_succeeded,
+            all_sessions_negative,
+            all_sessions_duplicate,
+            max_parallel_agents: request.agent_count,
+            participant_count: actual_session_count,
+            round_count: completed_round_count,
+            rejected_leads: &rejected_leads,
+        },
     )?;
 
     let token_usage = aggregate_token_usage(
@@ -439,7 +533,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
     append_log(
         &process_log,
         &format!(
-            "\n- Swarm finished; overall group result: {child_result}; archived finding submissions: {}; logical findings after title/root-cause grouping: {}.{}\n",
+            "\n- Swarm finished; overall group result: {child_result}; actual child sessions: {actual_session_count}; archived finding submissions: {}; logical findings after Lead-ID/root-cause grouping: {}.{}\n",
             findings.len(),
             group_findings(&findings).len(),
             if errors.is_empty() {
@@ -480,11 +574,12 @@ fn status_label(status: &ExitStatus) -> String {
 fn prepare_session(
     request: &SwarmRunRequest<'_, '_>,
     session_name: &str,
-    agent_name: &str,
+    assignment: &PeerAssignment,
     round: usize,
     workspace: &Path,
     board_path: &Path,
 ) -> Result<PreparedSession> {
+    let agent_name = assignment.agent_name.as_str();
     fs::create_dir_all(workspace)
         .with_context(|| format!("creating agent workspace {}", workspace.display()))?;
     let scratch_dir = workspace.join("scratch");
@@ -534,6 +629,45 @@ fn prepare_session(
         .replace("{scratch_dir}", &scratch_dir.display().to_string())
         .replace("{board_path}", &board_path.display().to_string());
     prompt.push_str(&swarm_instructions);
+    prompt.push_str("\n\n## Assigned round task\n\n");
+    let task_label = match &assignment.task {
+        PeerTask::Discovery if round == 1 => {
+            prompt.push_str("Independent blind discovery. Do not read other participants' findings before recording your initial lead selection.\n");
+            "blind discovery"
+        }
+        PeerTask::Discovery if request.dry_run && round > 1 => {
+            prompt.push_str("Dry-run preview only. At execution time, this slot will either challenge an unresolved lead selected from prior-round evidence or explore an unexamined source area.\n");
+            "adaptive follow-up preview"
+        }
+        PeerTask::Discovery => {
+            prompt.push_str("Fresh discovery. Read the shared board, avoid already-covered root causes, and select an unexamined code area.\n");
+            "fresh discovery"
+        }
+        PeerTask::Followup(lead) => {
+            let evidence_paths = lead
+                .evidence_paths
+                .iter()
+                .take(4)
+                .map(|path| format!("- `{}`", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let title = lead.title.chars().take(300).collect::<String>();
+            prompt.push_str(&format!(
+                "Independently challenge this unresolved lead before doing fresh discovery. Do not treat the prior report or local reproduction as proof of security impact.\n\n- Lead ID: `{}`\n- Reported title: {}\n- Existing participants: {}\n- Independent local reproductions: {}\n- Current security assessment: {}\n- Evidence archives:\n{}\n\nRe-read the source path, trigger assumptions, PoC, positive oracle, and closest negative control. Try to reproduce or falsify it from a clean setup. Determine whether the alleged behavior crosses a real security boundary under realistic attacker permissions. Record disagreements and failed reproduction attempts.\n",
+                lead.lead_id,
+                title,
+                lead.participant_count,
+                lead.reproduced_participant_count,
+                lead.security_impact.label(),
+                if evidence_paths.is_empty() {
+                    "- No archived evidence path was available yet.".to_string()
+                } else {
+                    evidence_paths
+                },
+            ));
+            "assigned lead challenge"
+        }
+    };
 
     let args = build_child_args(
         request.root_config_overrides,
@@ -552,7 +686,7 @@ fn prepare_session(
     fs::write(
         workspace.join("run-metadata.md"),
         format!(
-            "# Swarm session metadata\n\n- role: equal peer researcher\n- participant: {agent_name}\n- round: {round}/{}\n- audit group: candidate-{:03}\n- persistent workspace: {}\n- scratch directory: {}\n- keep scratch after run: {}\n- Linux source: {}\n- model: {}\n- API key variable: {} (value redacted)\n- API base URL: {}\n- sandbox: {}\n- prompt: prompt.md\n- command: command.txt\n- event log: agent-events.jsonl\n- stderr log: agent-stderr.log\n- usage summary: usage.json\n",
+            "# Swarm session metadata\n\n- role: equal peer researcher\n- task: {task_label}\n- participant: {agent_name}\n- round: {round}/{}\n- audit group: candidate-{:03}\n- persistent workspace: {}\n- scratch directory: {}\n- keep scratch after run: {}\n- Linux source: {}\n- model: {}\n- API key variable: {} (value redacted)\n- API base URL: {}\n- sandbox: {}\n- prompt: prompt.md\n- command: command.txt\n- event log: agent-events.jsonl\n- stderr log: agent-stderr.log\n- usage summary: usage.json\n",
             request.round_count,
             request.candidate_index,
             workspace.display(),
@@ -738,6 +872,41 @@ fn session_declares_quiescence(session: &PreparedSession) -> bool {
     })
 }
 
+fn session_rejects_assigned_lead(session: &PreparedSession, expected_lead_id: &str) -> bool {
+    let Ok(update) = fs::read_to_string(session.workspace.join("SWARM_UPDATE.md")) else {
+        return false;
+    };
+    let mut assigned_lead_id = None;
+    let mut rejected = false;
+    for line in update.lines() {
+        let Some((key, value)) = line
+            .trim()
+            .trim_start_matches(['-', '*', ' ', '`'])
+            .split_once(':')
+        else {
+            continue;
+        };
+        let key = normalize_swarm_field(key);
+        let value = value.trim().trim_matches(['`', '*', ' ']);
+        if key == "assignedleadid" {
+            assigned_lead_id = Some(normalize_swarm_field(value));
+        } else if key == "leadchallengeddisposition" {
+            rejected = value.to_ascii_lowercase().starts_with("rejected");
+        }
+    }
+    rejected
+        && assigned_lead_id
+            .is_some_and(|lead_id| lead_id == normalize_swarm_field(expected_lead_id))
+}
+
+fn normalize_swarm_field(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 fn read_bounded_file(path: &Path, max_chars: usize) -> String {
     let Ok(contents) = fs::read_to_string(path) else {
         return String::new();
@@ -884,16 +1053,32 @@ fn write_evidence_pointer(destination: &Path, source: &Path, keep_workspace: boo
     .with_context(|| format!("writing evidence pointer in {}", destination.display()))
 }
 
-fn write_candidate_summary(
-    candidate_dir: &Path,
-    findings: &[ArchivedFinding],
+struct CandidateSummaryContext<'a> {
     all_sessions_succeeded: bool,
     all_sessions_negative: bool,
     all_sessions_duplicate: bool,
-    agent_count: usize,
+    max_parallel_agents: usize,
+    participant_count: usize,
     round_count: usize,
+    rejected_leads: &'a LeadRejections,
+}
+
+fn write_candidate_summary(
+    candidate_dir: &Path,
+    findings: &[ArchivedFinding],
+    context: CandidateSummaryContext<'_>,
 ) -> Result<()> {
+    let CandidateSummaryContext {
+        all_sessions_succeeded,
+        all_sessions_negative,
+        all_sessions_duplicate,
+        max_parallel_agents,
+        participant_count,
+        round_count,
+        rejected_leads,
+    } = context;
     let groups = group_findings(findings);
+    let lead_triage = triage_leads(findings);
     let mut report = String::from(
         "# Swarm candidate report\n\nThis report summarizes the peer swarm. Each participant's full prompt, source audit, experiments, event stream, stderr, and usage are preserved under `agents/`. Every positive or plausible submission is archived under `findings/`; submissions with the same stable Lead ID are grouped here, with normalized title and root-cause matching as a legacy fallback. Their separate evidence remains available. No finding count limit is applied.\n\n",
     );
@@ -901,7 +1086,7 @@ fn write_candidate_summary(
         report.push_str("No participant submitted a complete positive or plausible finding folder. Read the round board and agent workspaces for coverage and rejected leads.\n");
     } else {
         report.push_str("## Findings\n\n");
-        for (index, group) in groups.iter().enumerate() {
+        for (index, (group, lead)) in groups.iter().zip(&lead_triage).enumerate() {
             let finding = group[0];
             let outcome = if group
                 .iter()
@@ -930,18 +1115,35 @@ fn write_candidate_summary(
                 })
                 .collect::<Vec<_>>()
                 .join("`, `");
+            let security_classes = group
+                .iter()
+                .map(|finding| finding.security_impact)
+                .collect::<BTreeSet<_>>();
+            let security_impact = if security_classes.len() == 1 {
+                security_classes
+                    .iter()
+                    .next()
+                    .copied()
+                    .unwrap_or(SecurityImpactClass::Unresolved)
+            } else {
+                SecurityImpactClass::Unresolved
+            };
+            let rejection_count = rejected_leads
+                .get(&lead.key)
+                .map_or(0, std::collections::BTreeSet::len);
             report.push_str(&format!(
-                "{}. **{}** — `{}`; submitted by `{agents}`; evidence archives: `{evidence_paths}`.\n",
+                "{}. **{}** (`Lead ID: {}`) — behavior consensus: `{outcome}`; security assessment: {}; challenged as rejected by {rejection_count} peer(s); submitted by `{agents}`; evidence archives: `{evidence_paths}`.\n",
                 index + 1,
                 if finding.title.trim().is_empty() {
                     "Untitled finding"
                 } else {
                     finding.title.as_str()
                 },
-                outcome,
+                lead.lead_id,
+                security_impact.label(),
             ));
         }
-        report.push_str("\nA swarm-level `confirmed` status requires local `confirmed` results from at least two distinct participants with the same stable Lead ID (or matching normalized title and root cause when the fingerprint has no Lead ID). The original participant outcome is preserved in each archived fingerprint; the coordinator records swarm consensus separately.\n");
+        report.push_str("\nA swarm-level `confirmed` status means at least two distinct participants independently reported local reproduction for the same stable Lead ID (or a legacy normalized title/root-cause match). This confirms the reported behavior, not its security impact. The separate security assessment must be checked against each archived report and experiment.\n");
     }
     fs::write(candidate_dir.join("candidate-report.md"), &report)
         .with_context(|| format!("writing swarm report in {}", candidate_dir.display()))?;
@@ -961,7 +1163,7 @@ fn write_candidate_summary(
         "inconclusive"
     };
     let mut fingerprint = format!(
-        "Outcome: {outcome}\nTitle: {}\nSubsystem: multiple or not established\nAffected files/functions: see individual finding folders under findings/\nRoot cause/invariant: see individual finding folders under findings/\nUser-controlled trigger: see individual finding folders under findings/\nObservable oracle: see individual finding folders under findings/\nAffected revision: see source-status-before.txt\nDuplicate-of: none\n\nSwarm coverage: {agent_count} peer agents, {round_count} shared-board rounds; {} archived finding folders.\n",
+        "Outcome: {outcome}\nTitle: {}\nSubsystem: multiple or not established\nAffected files/functions: see individual finding folders under findings/\nRoot cause/invariant: see individual finding folders under findings/\nUser-controlled trigger: see individual finding folders under findings/\nObservable oracle: see individual finding folders under findings/\nAffected revision: see source-status-before.txt\nDuplicate-of: none\n\nSwarm coverage: {participant_count} distinct peer participants, up to {max_parallel_agents} concurrent peers per round, {round_count} completed rounds; {} archived finding folders.\n",
         if groups.is_empty() {
             "No validated finding"
         } else {

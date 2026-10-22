@@ -18,6 +18,43 @@ pub(super) struct ArchivedFinding {
     lead_ids: BTreeSet<String>,
     pub(super) title: String,
     root_cause: String,
+    pub(super) security_impact: SecurityImpactClass,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum SecurityImpactClass {
+    SecurityRelevant,
+    Unresolved,
+    CorrectnessOnly,
+}
+
+impl SecurityImpactClass {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::SecurityRelevant => "security-relevant claim; requires evidence review",
+            Self::Unresolved => "unresolved",
+            Self::CorrectnessOnly => "correctness-only claim",
+        }
+    }
+
+    pub(super) fn priority(self) -> u8 {
+        match self {
+            Self::SecurityRelevant => 2,
+            Self::Unresolved => 1,
+            Self::CorrectnessOnly => 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct LeadTriage {
+    pub(super) key: String,
+    pub(super) lead_id: String,
+    pub(super) title: String,
+    pub(super) evidence_paths: Vec<PathBuf>,
+    pub(super) participant_count: usize,
+    pub(super) reproduced_participant_count: usize,
+    pub(super) security_impact: SecurityImpactClass,
 }
 
 pub(super) fn archived_finding(
@@ -57,7 +94,98 @@ pub(super) fn archived_finding(
         lead_ids,
         title: fingerprint_field(&contents, "Title"),
         root_cause: fingerprint_field(&contents, "Root cause/invariant"),
+        security_impact: security_impact_class(&report_contents),
     })
+}
+
+pub(super) fn triage_leads(findings: &[ArchivedFinding]) -> Vec<LeadTriage> {
+    let canonical_lead_ids = canonical_lead_ids(findings);
+    let legacy_claim_lead_ids = legacy_claim_lead_ids(findings, &canonical_lead_ids);
+    let mut groups: BTreeMap<String, Vec<&ArchivedFinding>> = BTreeMap::new();
+    for finding in findings {
+        let key = claim_key(finding, &canonical_lead_ids, &legacy_claim_lead_ids);
+        let key = if key.is_empty() {
+            finding.path.to_string_lossy().into_owned()
+        } else {
+            key
+        };
+        groups.entry(key).or_default().push(finding);
+    }
+
+    groups
+        .into_iter()
+        .map(|(key, group)| {
+            let participant_count = group
+                .iter()
+                .map(|finding| finding.agent_name.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let reproduced_participant_count = group
+                .iter()
+                .filter(|finding| finding.locally_reproduced)
+                .map(|finding| finding.agent_name.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let classes = group
+                .iter()
+                .map(|finding| finding.security_impact)
+                .collect::<BTreeSet<_>>();
+            let security_impact = if classes.len() == 1 {
+                classes
+                    .iter()
+                    .next()
+                    .copied()
+                    .unwrap_or(SecurityImpactClass::Unresolved)
+            } else {
+                SecurityImpactClass::Unresolved
+            };
+            let lead_id = group
+                .iter()
+                .flat_map(|finding| finding.lead_ids.iter())
+                .find_map(|lead_id| canonical_lead_ids.get(lead_id).cloned())
+                .unwrap_or_else(|| format!("legacy-{}", normalize_claim_text(&key)));
+            LeadTriage {
+                key,
+                lead_id,
+                title: group[0].title.clone(),
+                evidence_paths: group.iter().map(|finding| finding.path.clone()).collect(),
+                participant_count,
+                reproduced_participant_count,
+                security_impact,
+            }
+        })
+        .collect()
+}
+
+fn security_impact_class(report: &str) -> SecurityImpactClass {
+    let lines = report.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        let Some((key, value)) = line
+            .trim()
+            .trim_start_matches(['-', '*', ' ', '`'])
+            .split_once(':')
+        else {
+            continue;
+        };
+        let key = normalize_claim_text(key);
+        if key != "securityimpactclass" {
+            continue;
+        }
+        let value = normalize_claim_text(&paragraph_from_value(&lines, index, value));
+        let classes = [
+            ("securityrelevant", SecurityImpactClass::SecurityRelevant),
+            ("correctnessonly", SecurityImpactClass::CorrectnessOnly),
+            ("unresolved", SecurityImpactClass::Unresolved),
+        ]
+        .into_iter()
+        .filter_map(|(label, class)| value.contains(label).then_some(class))
+        .collect::<Vec<_>>();
+        if let [class] = classes.as_slice() {
+            return *class;
+        }
+        return SecurityImpactClass::Unresolved;
+    }
+    SecurityImpactClass::Unresolved
 }
 
 pub(super) fn apply_peer_confirmation_gate(findings: &mut [ArchivedFinding]) -> Result<()> {

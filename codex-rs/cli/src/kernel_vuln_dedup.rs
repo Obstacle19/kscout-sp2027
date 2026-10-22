@@ -1,15 +1,26 @@
-//! Persistent summaries used to help later kernel-vulnerability passes avoid
-//! rediscovering findings from the same output directory.
+//! Persistent finding summaries used to help later kernel-vulnerability passes
+//! avoid rediscovering findings from current and explicitly imported runs.
 
 use anyhow::Context;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 
 const MAX_SUMMARY_CHARS: usize = 2_400;
+const MAX_IMPORTED_INDEX_ENTRIES: usize = 12;
 
+#[cfg(test)]
 pub(super) fn refresh_finding_index(candidates_dir: &Path, index_path: &Path) -> Result<()> {
+    refresh_finding_index_with_prior(candidates_dir, index_path, &[])
+}
+
+pub(super) fn refresh_finding_index_with_prior(
+    candidates_dir: &Path,
+    index_path: &Path,
+    prior_indexes: &[PathBuf],
+) -> Result<()> {
     let mut candidate_dirs = Vec::new();
     for entry in fs::read_dir(candidates_dir)
         .with_context(|| format!("reading candidate directory {}", candidates_dir.display()))?
@@ -32,7 +43,7 @@ pub(super) fn refresh_finding_index(candidates_dir: &Path, index_path: &Path) ->
 
     let mut index = String::from(
         "# Candidate finding exclusion index\n\n\
-         Generated from candidate artifacts in this output directory. Read these entries only to exclude duplicate root causes; they are not discovery evidence.\n",
+         Generated from this output directory and explicitly imported prior indexes. Read entries only to exclude duplicate root causes; they are not discovery evidence.\n",
     );
     let mut seen_findings = HashSet::new();
 
@@ -65,10 +76,11 @@ pub(super) fn refresh_finding_index(candidates_dir: &Path, index_path: &Path) ->
             if summary.trim().is_empty() {
                 continue;
             }
-            let finding_key = finding_key(&summary, &summary_path);
-            if !seen_findings.insert(finding_key) {
+            let finding_keys = finding_keys(&summary, &summary_path);
+            if finding_keys.iter().any(|key| seen_findings.contains(key)) {
                 continue;
             }
+            seen_findings.extend(finding_keys);
             let mut chars = summary.chars();
             let excerpt = chars.by_ref().take(MAX_SUMMARY_CHARS).collect::<String>();
             let truncated = chars.next().is_some();
@@ -87,27 +99,113 @@ pub(super) fn refresh_finding_index(candidates_dir: &Path, index_path: &Path) ->
         }
     }
 
+    let mut imported = Vec::new();
+    for prior_index in prior_indexes {
+        let contents = fs::read_to_string(prior_index)
+            .with_context(|| format!("reading prior finding index {}", prior_index.display()))?;
+        let sections = split_index_sections(&contents);
+        for (heading, summary) in sections.into_iter().rev() {
+            if summary.trim().is_empty() {
+                continue;
+            }
+            let keys = finding_keys(&summary, prior_index);
+            if keys.iter().any(|key| seen_findings.contains(key)) {
+                continue;
+            }
+            seen_findings.extend(keys);
+            imported.push((prior_index.clone(), heading, summary));
+            if imported.len() == MAX_IMPORTED_INDEX_ENTRIES {
+                break;
+            }
+        }
+        if imported.len() == MAX_IMPORTED_INDEX_ENTRIES {
+            break;
+        }
+    }
+    imported.reverse();
+    for (entry_index, (prior_index, heading, summary)) in imported.into_iter().enumerate() {
+        let mut chars = summary.chars();
+        let excerpt = chars.by_ref().take(MAX_SUMMARY_CHARS).collect::<String>();
+        let truncated = chars.next().is_some();
+        index.push_str(&format!(
+            "\n\n## Prior finding {:03}: {heading}\n\n",
+            entry_index + 1
+        ));
+        index.push_str(&format!("Imported from: {}\n\n", prior_index.display()));
+        index.push_str(excerpt.trim());
+        if truncated {
+            index.push_str("\n\n[Excerpt truncated; consult the prior index source for details.]");
+        }
+    }
+
     fs::write(index_path, index)
         .with_context(|| format!("writing finding index {}", index_path.display()))
 }
 
-fn finding_key(summary: &str, path: &Path) -> String {
+fn finding_keys(summary: &str, path: &Path) -> Vec<String> {
+    let mut keys = Vec::new();
+    let lead_id = summary_field(summary, "Lead ID");
+    let lead_id = normalize(&lead_id);
+    if !lead_id.is_empty() && !matches!(lead_id.as_str(), "none" | "unknown" | "na") {
+        keys.push(format!("lead:{lead_id}"));
+    }
     let title = summary_field(summary, "Title");
     let root_cause = summary_field(summary, "Root cause/invariant");
-    let normalize = |value: &str| {
-        value
-            .chars()
-            .filter(|character| character.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
     let title = normalize(&title);
     let root_cause = normalize(&root_cause);
     if title.is_empty() || root_cause.is_empty() {
-        path.to_string_lossy().into_owned()
+        let content = normalize(summary);
+        if content.is_empty() {
+            keys.push(path.to_string_lossy().into_owned());
+        } else {
+            keys.push(format!("{}:{content}", path.display()));
+        }
     } else {
-        format!("{title}:{root_cause}")
+        keys.push(format!("claim:{title}:{root_cause}"));
     }
+    keys
+}
+
+fn normalize(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn split_index_sections(contents: &str) -> Vec<(String, String)> {
+    let mut sections = Vec::new();
+    let lines = contents.lines().collect::<Vec<_>>();
+    let mut index = 0;
+    while index + 1 < lines.len() {
+        let Some(heading) = lines[index].strip_prefix("## ") else {
+            index += 1;
+            continue;
+        };
+        if !lines[index + 1].starts_with("Source:")
+            && !lines[index + 1].starts_with("Imported from:")
+        {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let mut body = String::new();
+        while index < lines.len() {
+            if lines[index].starts_with("## ")
+                && index + 1 < lines.len()
+                && (lines[index + 1].starts_with("Source:")
+                    || lines[index + 1].starts_with("Imported from:"))
+            {
+                break;
+            }
+            body.push_str(lines[index]);
+            body.push('\n');
+            index += 1;
+        }
+        sections.push((heading.trim().to_string(), body));
+    }
+    sections
 }
 
 fn summary_field(summary: &str, wanted: &str) -> String {

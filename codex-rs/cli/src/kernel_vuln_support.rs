@@ -78,8 +78,8 @@ pub(super) fn initialize_output_files(
              - Linux source: {}\n\
              - Requested autonomous passes per run: {}\n\
              - Swarm audit groups: {}\n\
-             - Swarm agents per round: {}\n\
-             - Swarm argument rounds: {}\n\
+             - Maximum parallel swarm agents per round: {}\n\
+             - Maximum swarm argument rounds: {}\n\
              - API key variable: {} (value is never stored here)\n\
              - API base URL: {}\n\
              - Model: {}\n\
@@ -89,7 +89,7 @@ pub(super) fn initialize_output_files(
              - Keep scratch workspaces after runs: {}\n\n\
              ## Layout\n\n\
              - PROCESS_LOG.md: orchestrator-level timeline and statuses.\n\
-             - FINDING_INDEX.md: prior candidate fingerprints used to exclude duplicate findings.\n\
+             - FINDING_INDEX.md: current candidate fingerprints plus explicitly imported prior indexes, used only to exclude duplicate findings.\n\
              - USAGE.jsonl: cumulative per-candidate elapsed time and token usage summaries.\n\
              - rule-scan-*.md: optional deterministic CVE-derived candidate enumeration and filter report.\n\
              - PROMPT_TEMPLATE.md: fixed research contract.\n\
