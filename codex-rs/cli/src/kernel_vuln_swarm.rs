@@ -190,8 +190,8 @@ pub(super) struct SwarmRunRequest<'a, 'b> {
 }
 
 pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<CandidateRunOutcome> {
-    if !(2..=8).contains(&request.agent_count) {
-        bail!("swarm agent count must be between 2 and 8");
+    if !(2..=10).contains(&request.agent_count) {
+        bail!("swarm agent count must be between 2 and 10");
     }
     if !(1..=4).contains(&request.round_count) {
         bail!("swarm round count must be between 1 and 4");

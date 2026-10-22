@@ -175,8 +175,8 @@ pub(crate) struct KernelVulnCommand {
     #[arg(long = "swarm", visible_alias = "multi-agent", default_value_t = false)]
     swarm: bool,
 
-    /// Number of peer agents per swarm round (2 to 8).
-    #[arg(long = "swarm-agents", default_value_t = 3, value_parser = clap::value_parser!(u8).range(2..=8))]
+    /// Number of peer agents per swarm round (2 to 10).
+    #[arg(long = "swarm-agents", default_value_t = 3, value_parser = clap::value_parser!(u8).range(2..=10))]
     swarm_agents: u8,
 
     /// Maximum number of shared-board argument rounds (1 to 4).
@@ -331,8 +331,8 @@ pub(crate) async fn run(
         "--count must be between 1 and 100"
     );
     ensure!(
-        (2..=8).contains(&swarm_agents),
-        "--swarm-agents must be between 2 and 8"
+        (2..=10).contains(&swarm_agents),
+        "--swarm-agents must be between 2 and 10"
     );
     ensure!(
         (1..=4).contains(&swarm_rounds),

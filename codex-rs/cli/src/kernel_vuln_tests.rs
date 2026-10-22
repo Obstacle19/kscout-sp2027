@@ -144,20 +144,20 @@ fn cve_rules_are_disabled_by_default_and_enabled_only_by_flag() {
         "kernel-vuln",
         "--swarm",
         "--swarm-agents",
-        "5",
+        "10",
         "--swarm-rounds",
         "3",
     ])
     .expect("swarm options should parse");
     assert!(swarm_command.swarm);
-    assert_eq!(swarm_command.swarm_agents, 5);
+    assert_eq!(swarm_command.swarm_agents, 10);
     assert_eq!(swarm_command.swarm_rounds, 3);
 
     let legacy_command = KernelVulnCommand::try_parse_from(["kernel-vuln", "--multi-agent"])
         .expect("legacy multi-agent alias should parse");
     assert!(legacy_command.swarm);
 
-    assert!(KernelVulnCommand::try_parse_from(["kernel-vuln", "--swarm-agents", "9"]).is_err());
+    assert!(KernelVulnCommand::try_parse_from(["kernel-vuln", "--swarm-agents", "11"]).is_err());
     assert!(KernelVulnCommand::try_parse_from(["kernel-vuln", "--swarm-rounds", "0"]).is_err());
 
     let rule_command = KernelVulnCommand::try_parse_from(["kernel-vuln", "--use-cve-rules"])

@@ -98,7 +98,7 @@ export PROVIDER_API_KEY='your-api-key'
   --show-progress
 ```
 
-默认每轮 3 个 agent、最多 2 轮；一轮内并发、轮次之间顺序执行。`--count 1` 是一个 swarm 组，默认最多安排 6 个 child session。可用 `--swarm-agents` 设置 2–8 个 peer，用 `--swarm-rounds` 设置 1–4 轮。一个 finding 要保留为 swarm 级 `confirmed`，还需要至少两个不同 peer 独立报告相符的标题和根因；否则归档会降为 `plausible`。`--multi-agent` 仍是 `--swarm` 的兼容别名。不同模型、源码版本和审计范围下的效果可能不同，swarm 不保证更短耗时、更低 token 开销或更低误报率。
+默认每轮 3 个 agent、最多 2 轮；一轮内并发、轮次之间顺序执行。`--count 1` 是一个 swarm 组，默认最多安排 6 个 child session。可用 `--swarm-agents` 设置 2–10 个 peer，用 `--swarm-rounds` 设置 1–4 轮。一个 finding 要保留为 swarm 级 `confirmed`，还需要至少两个不同 peer 独立报告相符的标题和根因；否则归档会降为 `plausible`。`--multi-agent` 仍是 `--swarm` 的兼容别名。不同模型、源码版本和审计范围下的效果可能不同，swarm 不保证更短耗时、更低 token 开销或更低误报率。
 
 ### CVE 派生规则
 
