@@ -1,4 +1,4 @@
-//! Lead identity and peer reproduction consensus for swarm findings.
+//! Lead identity and evidence-state classification for swarm findings.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -12,10 +12,12 @@ use super::kernel_vuln_usage::read_finding_outcome;
 
 pub(super) struct ArchivedFinding {
     pub(super) agent_name: String,
+    pub(super) independent_analysis: bool,
+    pub(super) followup_evidence: bool,
     pub(super) path: PathBuf,
-    locally_reproduced: bool,
+    pub(super) locally_reproduced: bool,
     pub(super) swarm_outcome: String,
-    lead_ids: BTreeSet<String>,
+    pub(super) lead_ids: BTreeSet<String>,
     pub(super) title: String,
     root_cause: String,
     pub(super) security_impact: SecurityImpactClass,
@@ -54,11 +56,13 @@ pub(super) struct LeadTriage {
     pub(super) evidence_paths: Vec<PathBuf>,
     pub(super) participant_count: usize,
     pub(super) reproduced_participant_count: usize,
+    pub(super) independent_analysis_count: usize,
     pub(super) security_impact: SecurityImpactClass,
 }
 
 pub(super) fn archived_finding(
     agent_name: &str,
+    independent_analysis: bool,
     path: PathBuf,
     fingerprint: &Path,
     report: &Path,
@@ -87,6 +91,8 @@ pub(super) fn archived_finding(
     }
     Ok(ArchivedFinding {
         agent_name: agent_name.to_string(),
+        independent_analysis,
+        followup_evidence: false,
         path,
         locally_reproduced: outcome.eq_ignore_ascii_case("confirmed")
             || report_declares_local_reproduction(&report_contents),
@@ -96,6 +102,26 @@ pub(super) fn archived_finding(
         root_cause: fingerprint_field(&contents, "Root cause/invariant"),
         security_impact: security_impact_class(&report_contents),
     })
+}
+
+pub(super) fn archived_followup_reproduction(
+    agent_name: &str,
+    lead: &LeadTriage,
+    independent_analysis: bool,
+    evidence_path: PathBuf,
+) -> ArchivedFinding {
+    ArchivedFinding {
+        agent_name: agent_name.to_string(),
+        independent_analysis,
+        followup_evidence: true,
+        path: evidence_path,
+        locally_reproduced: true,
+        swarm_outcome: String::new(),
+        lead_ids: [lead.lead_id.clone()].into_iter().collect(),
+        title: lead.title.clone(),
+        root_cause: lead.key.clone(),
+        security_impact: lead.security_impact,
+    }
 }
 
 pub(super) fn triage_leads(findings: &[ArchivedFinding]) -> Vec<LeadTriage> {
@@ -126,6 +152,12 @@ pub(super) fn triage_leads(findings: &[ArchivedFinding]) -> Vec<LeadTriage> {
                 .map(|finding| finding.agent_name.as_str())
                 .collect::<BTreeSet<_>>()
                 .len();
+            let independent_analysis_count = group
+                .iter()
+                .filter(|finding| finding.independent_analysis)
+                .map(|finding| finding.agent_name.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
             let classes = group
                 .iter()
                 .map(|finding| finding.security_impact)
@@ -151,6 +183,7 @@ pub(super) fn triage_leads(findings: &[ArchivedFinding]) -> Vec<LeadTriage> {
                 evidence_paths: group.iter().map(|finding| finding.path.clone()).collect(),
                 participant_count,
                 reproduced_participant_count,
+                independent_analysis_count,
                 security_impact,
             }
         })
@@ -188,7 +221,7 @@ fn security_impact_class(report: &str) -> SecurityImpactClass {
     SecurityImpactClass::Unresolved
 }
 
-pub(super) fn apply_peer_confirmation_gate(findings: &mut [ArchivedFinding]) -> Result<()> {
+pub(super) fn classify_peer_evidence(findings: &mut [ArchivedFinding]) -> Result<()> {
     let canonical_lead_ids = canonical_lead_ids(findings);
     let legacy_claim_lead_ids = legacy_claim_lead_ids(findings, &canonical_lead_ids);
     let mut confirming_agents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -201,20 +234,41 @@ pub(super) fn apply_peer_confirmation_gate(findings: &mut [ArchivedFinding]) -> 
                 .insert(finding.agent_name.clone());
         }
     }
+    let independent_analysts = findings.iter().fold(
+        BTreeMap::<String, BTreeSet<String>>::new(),
+        |mut analysts, finding| {
+            if finding.independent_analysis {
+                let key = claim_key(finding, &canonical_lead_ids, &legacy_claim_lead_ids);
+                if !key.is_empty() {
+                    analysts
+                        .entry(key)
+                        .or_default()
+                        .insert(finding.agent_name.clone());
+                }
+            }
+            analysts
+        },
+    );
     for finding in findings.iter_mut() {
+        if finding.followup_evidence {
+            continue;
+        }
         let key = claim_key(finding, &canonical_lead_ids, &legacy_claim_lead_ids);
         let peers = confirming_agents.get(&key).map_or(0, BTreeSet::len);
-        finding.swarm_outcome = if peers >= 2 {
-            "confirmed".to_string()
+        let evidence_state = if peers >= 2 {
+            "CROSS_REPRODUCED"
+        } else if peers == 1 {
+            "AGENT_REPRODUCED"
         } else {
-            "plausible".to_string()
+            "CANDIDATE"
         };
+        finding.swarm_outcome = evidence_state.to_ascii_lowercase();
+        let independent_analysis_count = independent_analysts.get(&key).map_or(0, BTreeSet::len);
         let fingerprint_path = finding.path.join("finding-fingerprint.md");
         let mut fingerprint = fs::read_to_string(&fingerprint_path)
             .with_context(|| format!("reading {}", fingerprint_path.display()))?;
         fingerprint.push_str(&format!(
-            "\nSwarm consensus outcome: {}\nDistinct participants with a locally reproduced result for this lead: {peers}.\n",
-            finding.swarm_outcome,
+            "\nSwarm evidence status: {evidence_state}\nDistinct participants reporting a local execution: {peers}\nArchived submissions with independent analysis before shared evidence: {independent_analysis_count}\nExternal runner verification: NOT_RUN\nReportability review: NOT_ASSESSED\nSecurity confirmation: NOT_ASSESSED\n",
         ));
         fs::write(&fingerprint_path, fingerprint)
             .with_context(|| format!("updating {}", fingerprint_path.display()))?;

@@ -98,9 +98,9 @@ export PROVIDER_API_KEY='your-api-key'
   --show-progress
 ```
 
-默认第一轮 3 个 peer、最多 2 轮；一轮内并发、轮次之间顺序执行。后续轮最多启动 `--swarm-agents` 个 session，其中至多 `N-1` 个挑战待验证 lead，至少留一个 session 搜索新方向；没有可跟进的 lead 时只启动一个探索 peer。若 peer 全部报告无后续任务且没有待独立复现或待定安全影响的 lead，会提前结束。因此 `--count 1` 是一个 swarm 组，默认最多可用 6 个 child session，实际数量可能更少；日志会记录实际数量。`--swarm-agents` 设置每轮并发上限（2–10），`--swarm-rounds` 设置最多轮数（1–4）。
+默认第一轮 3 个 peer、最多 2 轮；一轮内并发、轮次之间顺序执行。后续轮按待办 lead 数量，将约 25%～40% 的 session 留给新方向，其余按证据缺口挑战不同 lead；没有待跟进 lead 时所有 session 都探索。首次跟进先进行盲式源码分析，反复没有新增证据的 lead 会暂停调度但保留记录。若 peer 全部报告无后续任务且没有待独立复现或待定安全影响的 lead，会提前结束。因此 `--count 1` 是一个 swarm 组，默认最多可用 6 个 child session，实际数量可能更少；日志会记录实际数量。`--swarm-agents` 设置每轮并发上限（2–16），`--swarm-rounds` 设置最多轮数（1–4）。
 
-跟进 lead 按明确的安全影响分类、独立复现数和报告 peer 数排序；未满两个独立复现，或安全影响仍未定的 lead 会继续进入跟进队列。两个不同 peer 都提交结构化的 `rejected` 结论后，该 lead 不再消耗 challenge 轮次，但反对意见与原始正向证据都会保留。swarm 级 `confirmed` 只表示至少两个不同 peer 独立复现了同一个 Lead ID 的行为，不等于已确认安全漏洞；还要检查归档报告中的安全影响、攻击者前提和边界证据。`--prior-finding-index PATH` 可传入先前运行的 `FINDING_INDEX.md` 或其输出目录，重复该参数可导入多份索引，帮助不同输出目录之间排除重复根因。`--multi-agent` 仍是 `--swarm` 的兼容别名。此架构旨在把后续预算集中到待验证线索并保留新方向探索；尚不能据此保证更短耗时、更低 token 开销或更低误报率。
+跟进 lead 按证据缺口、影响分类、信息增益和历史 Token/时长成本排序。有效证据引用的 challenge 复现会进入跨 peer 计数。两名不同 peer 都提供证据并提交 `rejected` 后，该 lead 才会标记为 rejected；达到当前规范阈值的无进展议题会暂停，后续同根因新证据可重新激活。状态区分为 `CANDIDATE`、`AGENT_REPRODUCED`、`CROSS_REPRODUCED`；两个 peer 报告同一 Lead ID 的本地执行只构成 cross-reproduced，不代表独立根因分析或外部 runner 验证。`--swarm-verifier PATH` 可调用外部 VM 验证协议；协调器会检查结果结构、当前 Linux HEAD、配置摘要、重复正例、负对照、耗时和证据路径，但 VM 隔离仍由已配置的 verifier 实现。`--swarm-norms PATH` 加载冻结的版本策略；`--adapt-swarm-norms FEEDBACK.json --adapt-swarm-norms-output PATH` 根据等总预算的独立盲审反馈和 baseline/norm-guided 事件轨迹生成下一版，保留轨迹画像并归纳软规范建议。独立评审可在运行后用 `--apply-swarm-assessment ASSESSMENT.json` 记录 `REPORTABLE` 和 `SECURITY_CONFIRMED` 状态；Agent 共识不能设置这些终态。`SWARM_EVENTS.jsonl`、`SWARM_INDEX.json`、`SWARM_NORMS.json`、`SWARM_NORM_REVIEW.md`、`SWARM_REVIEW.json` 和 feedback template 保存事件、议题、评审和策略版本。`--prior-finding-index PATH` 可传入先前运行的 `FINDING_INDEX.md` 或其输出目录，重复该参数可导入多份索引，帮助不同输出目录之间排除重复根因。`--multi-agent` 仍是 `--swarm` 的兼容别名。是否改善发现效率和验证质量仍需按文档执行对照评估。
 
 ### CVE 派生规则
 

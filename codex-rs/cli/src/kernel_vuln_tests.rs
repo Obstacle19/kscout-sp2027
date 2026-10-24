@@ -157,7 +157,7 @@ fn cve_rules_are_disabled_by_default_and_enabled_only_by_flag() {
         .expect("legacy multi-agent alias should parse");
     assert!(legacy_command.swarm);
 
-    assert!(KernelVulnCommand::try_parse_from(["kernel-vuln", "--swarm-agents", "11"]).is_err());
+    assert!(KernelVulnCommand::try_parse_from(["kernel-vuln", "--swarm-agents", "17"]).is_err());
     assert!(KernelVulnCommand::try_parse_from(["kernel-vuln", "--swarm-rounds", "0"]).is_err());
 
     let rule_command = KernelVulnCommand::try_parse_from(["kernel-vuln", "--use-cve-rules"])
@@ -288,6 +288,7 @@ esac
         keep_workspace: false,
     };
     let root_config_overrides = CliConfigOverrides::default();
+    let norm_set = super::kernel_vuln_swarm_policy::SwarmNormSet::default();
     let run_started_at = chrono::Utc::now().to_rfc3339();
     let outcome =
         super::kernel_vuln_swarm::run_candidate(super::kernel_vuln_swarm::SwarmRunRequest {
@@ -306,6 +307,8 @@ esac
             rule_review: None,
             agent_count: 2,
             round_count: 2,
+            norm_set: &norm_set,
+            verifier: None,
         })
         .await
         .expect("run mock swarm");

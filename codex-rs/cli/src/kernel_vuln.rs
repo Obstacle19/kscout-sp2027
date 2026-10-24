@@ -37,8 +37,30 @@ mod kernel_vuln_support;
 mod kernel_vuln_swarm;
 #[path = "kernel_vuln_swarm_consensus.rs"]
 mod kernel_vuln_swarm_consensus;
+#[path = "kernel_vuln_swarm_evaluation.rs"]
+mod kernel_vuln_swarm_evaluation;
+#[path = "kernel_vuln_swarm_index.rs"]
+mod kernel_vuln_swarm_index;
+#[path = "kernel_vuln_swarm_induction.rs"]
+mod kernel_vuln_swarm_induction;
+#[path = "kernel_vuln_swarm_metrics.rs"]
+mod kernel_vuln_swarm_metrics;
+#[path = "kernel_vuln_swarm_norms.rs"]
+mod kernel_vuln_swarm_norms;
 #[path = "kernel_vuln_swarm_planner.rs"]
 mod kernel_vuln_swarm_planner;
+#[path = "kernel_vuln_swarm_policy.rs"]
+mod kernel_vuln_swarm_policy;
+#[path = "kernel_vuln_swarm_protocol.rs"]
+mod kernel_vuln_swarm_protocol;
+#[path = "kernel_vuln_swarm_review.rs"]
+mod kernel_vuln_swarm_review;
+#[path = "kernel_vuln_swarm_runner.rs"]
+mod kernel_vuln_swarm_runner;
+#[path = "kernel_vuln_swarm_runner_report.rs"]
+mod kernel_vuln_swarm_runner_report;
+#[path = "kernel_vuln_swarm_trace.rs"]
+mod kernel_vuln_swarm_trace;
 #[path = "kernel_vuln_usage.rs"]
 mod kernel_vuln_usage;
 
@@ -181,13 +203,51 @@ pub(crate) struct KernelVulnCommand {
     #[arg(long = "swarm", visible_alias = "multi-agent", default_value_t = false)]
     swarm: bool,
 
-    /// Number of peer agents per swarm round (2 to 10).
-    #[arg(long = "swarm-agents", default_value_t = 3, value_parser = clap::value_parser!(u8).range(2..=10))]
+    /// Number of peer agents per swarm round (2 to 16).
+    #[arg(long = "swarm-agents", default_value_t = 3, value_parser = clap::value_parser!(u8).range(2..=16))]
     swarm_agents: u8,
 
     /// Maximum number of shared-board argument rounds (1 to 4).
     #[arg(long = "swarm-rounds", default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=4))]
     swarm_rounds: u8,
+
+    /// Load a frozen, versioned norm policy for this swarm run.
+    #[arg(long = "swarm-norms", value_name = "PATH")]
+    swarm_norms: Option<PathBuf>,
+
+    /// Run an external verifier using the documented JSON request/result protocol.
+    #[arg(long = "swarm-verifier", value_name = "EXECUTABLE")]
+    swarm_verifier: Option<PathBuf>,
+
+    /// Create the next frozen norm version from blind, independent evaluator feedback.
+    #[arg(
+        long = "adapt-swarm-norms",
+        value_name = "FEEDBACK.json",
+        requires = "adapt_swarm_norms_output"
+    )]
+    adapt_swarm_norms: Option<PathBuf>,
+
+    /// Output path for the next norm version produced by --adapt-swarm-norms.
+    #[arg(
+        long = "adapt-swarm-norms-output",
+        value_name = "PATH",
+        requires = "adapt_swarm_norms"
+    )]
+    adapt_swarm_norms_output: Option<PathBuf>,
+
+    /// Apply an independent, architecture-blinded reportability and security assessment.
+    #[arg(
+        long = "apply-swarm-assessment",
+        value_name = "ASSESSMENT.json",
+        conflicts_with_all = [
+            "adapt_swarm_norms",
+            "adapt_swarm_norms_output",
+            "swarm",
+            "swarm_norms",
+            "swarm_verifier"
+        ]
+    )]
+    apply_swarm_assessment: Option<PathBuf>,
 
     /// Use focused, knowledge-base-guided Linux kernel reviews instead of autonomous search.
     /// Related source hits for one rule share a single model review. Disabled by default;
@@ -305,6 +365,36 @@ pub(crate) async fn run(
     root_config_overrides: &CliConfigOverrides,
     arg0_paths: Arg0DispatchPaths,
 ) -> Result<()> {
+    if let Some(assessment_path) = command.apply_swarm_assessment.as_deref() {
+        let (candidate_dir, assessed_leads) =
+            kernel_vuln_swarm_review::apply_assessment(assessment_path)?;
+        println!(
+            "[kernel-vuln] recorded independent assessment for {assessed_leads} lead(s) in {}",
+            candidate_dir.display()
+        );
+        return Ok(());
+    }
+    if let Some(feedback_path) = command.adapt_swarm_norms.as_deref() {
+        let output_path = command
+            .adapt_swarm_norms_output
+            .as_deref()
+            .context("--adapt-swarm-norms requires --adapt-swarm-norms-output")?;
+        let norms = kernel_vuln_swarm_induction::adapt_norm_set(
+            feedback_path,
+            command.swarm_norms.as_deref(),
+            output_path,
+        )?;
+        println!(
+            "[kernel-vuln] wrote frozen swarm norm version {} to {}",
+            norms.version,
+            output_path.display()
+        );
+        return Ok(());
+    }
+    ensure!(
+        command.adapt_swarm_norms_output.is_none(),
+        "--adapt-swarm-norms-output requires --adapt-swarm-norms"
+    );
     let rule_mode_enabled = command.rule_mode_enabled();
     let KernelVulnCommand {
         linux_path,
@@ -314,6 +404,11 @@ pub(crate) async fn run(
         swarm,
         swarm_agents,
         swarm_rounds,
+        swarm_norms,
+        swarm_verifier,
+        adapt_swarm_norms: _,
+        adapt_swarm_norms_output: _,
+        apply_swarm_assessment: _,
         api_key_env,
         api_base_url,
         model,
@@ -332,14 +427,36 @@ pub(crate) async fn run(
         dry_run,
     } = command;
     let use_cve_rules = rule_mode_enabled;
+    ensure!(
+        swarm || swarm_norms.is_none(),
+        "--swarm-norms can only be used with --swarm or --adapt-swarm-norms"
+    );
+    ensure!(
+        swarm || swarm_verifier.is_none(),
+        "--swarm-verifier can only be used with --swarm"
+    );
+    let swarm_norm_set = kernel_vuln_swarm_policy::SwarmNormSet::load(swarm_norms.as_deref())?;
+    let swarm_verifier = swarm_verifier
+        .map(|path| {
+            std::fs::canonicalize(&path)
+                .with_context(|| format!("resolving swarm verifier {}", path.display()))
+        })
+        .transpose()?;
+    if let Some(verifier) = swarm_verifier.as_deref() {
+        ensure!(
+            verifier.is_file(),
+            "swarm verifier is not a file: {}",
+            verifier.display()
+        );
+    }
 
     ensure!(
         (1..=100).contains(&count),
         "--count must be between 1 and 100"
     );
     ensure!(
-        (2..=10).contains(&swarm_agents),
-        "--swarm-agents must be between 2 and 10"
+        (2..=16).contains(&swarm_agents),
+        "--swarm-agents must be between 2 and 16"
     );
     ensure!(
         (1..=4).contains(&swarm_rounds),
@@ -684,6 +801,8 @@ pub(crate) async fn run(
                     rule_review,
                     agent_count: usize::from(swarm_agents),
                     round_count: usize::from(swarm_rounds),
+                    norm_set: &swarm_norm_set,
+                    verifier: swarm_verifier.as_deref(),
                 })
                 .await?;
             }
@@ -718,6 +837,8 @@ pub(crate) async fn run(
                 rule_review,
                 agent_count: usize::from(swarm_agents),
                 round_count: usize::from(swarm_rounds),
+                norm_set: &swarm_norm_set,
+                verifier: swarm_verifier.as_deref(),
             })
             .await
             {

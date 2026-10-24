@@ -5,6 +5,7 @@
 //! reproduce, reject, or branch from any earlier lead. There is no finding
 //! count limit. Agent count and rounds are bounded by the CLI to control cost.
 
+use super::FINDING_INDEX_FILE_NAME;
 use super::RunOptions;
 use super::kernel_vuln_cleanup::cleanup_scratch_directory;
 use super::kernel_vuln_rule_prompt::render_rule_review_prompt;
@@ -17,16 +18,32 @@ use super::kernel_vuln_support::run_agent;
 use super::kernel_vuln_support::sandbox_name;
 use super::kernel_vuln_swarm_consensus::ArchivedFinding;
 use super::kernel_vuln_swarm_consensus::SecurityImpactClass;
-use super::kernel_vuln_swarm_consensus::apply_peer_confirmation_gate;
 use super::kernel_vuln_swarm_consensus::archived_finding;
+use super::kernel_vuln_swarm_consensus::archived_followup_reproduction;
+use super::kernel_vuln_swarm_consensus::classify_peer_evidence;
 use super::kernel_vuln_swarm_consensus::group_findings;
 use super::kernel_vuln_swarm_consensus::triage_leads;
-use super::kernel_vuln_swarm_planner::LeadRejections;
+use super::kernel_vuln_swarm_evaluation::write_evaluation_template;
+use super::kernel_vuln_swarm_index::write_swarm_index;
+use super::kernel_vuln_swarm_metrics::write_norm_review;
+use super::kernel_vuln_swarm_norms::EventDraft;
+use super::kernel_vuln_swarm_norms::SwarmEventLog;
+use super::kernel_vuln_swarm_norms::write_norm_manifest;
+use super::kernel_vuln_swarm_planner::FollowupUpdate;
+use super::kernel_vuln_swarm_planner::LeadHistory;
 use super::kernel_vuln_swarm_planner::PeerAssignment;
 use super::kernel_vuln_swarm_planner::PeerTask;
 use super::kernel_vuln_swarm_planner::argument_round;
 use super::kernel_vuln_swarm_planner::has_actionable_leads;
 use super::kernel_vuln_swarm_planner::initial_round;
+use super::kernel_vuln_swarm_planner::update_followup_state;
+use super::kernel_vuln_swarm_policy::SwarmNormSet;
+use super::kernel_vuln_swarm_protocol::normalize_swarm_field;
+use super::kernel_vuln_swarm_protocol::read_challenge_update;
+use super::kernel_vuln_swarm_protocol::validate_evidence_refs;
+use super::kernel_vuln_swarm_runner::VerifyLeadsRequest;
+use super::kernel_vuln_swarm_runner::verify_leads;
+use super::kernel_vuln_swarm_runner_report::add_verification_to_reports;
 use super::kernel_vuln_usage::CandidateUsageRecord;
 use super::kernel_vuln_usage::TokenUsageSummary;
 use super::kernel_vuln_usage::aggregate_token_usage;
@@ -40,6 +57,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_utils_cli::CliConfigOverrides;
 use futures::future::join_all;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
@@ -69,15 +87,18 @@ repeatable userland oracle with a close negative control are required.
 
 Round: {round}/{round_count}. Participant: {agent_name}. Your rotating audit
 lens is: {lens}
+Task context: `{context_path}`
+Frozen norm policy: `{workspace}/SWARM_NORMS.json` (version {norm_version}). Follow the hard rules and report soft-rule omissions in the structured update.
+Trace-induced guidance from the frozen version: {induced_guidance}
 
-All files from earlier rounds are available below `{candidate_dir}/agents/`.
-The current shared argument board is `{board_path}`. In round 1, work
-independently before seeing any other participant's claims. In later rounds,
-read the board and the relevant original evidence, then explicitly argue for or
-against each unresolved lead. You may reject a lead, confirm it through an
-independent clean setup, or start a new branch. Record each challenge and its
-evidence in `peer-arguments.md` in your workspace. Do not edit another
-participant's files or the shared board.
+Shared prior context: {shared_context_hint}. Read your bounded, task-specific
+`SWARM_CONTEXT.md` first; open only relevant evidence when your task requires
+it. In round 1, work independently before seeing any other participant's
+claims. A blind challenge must save a source-based independent analysis in
+`blind-analysis.md` before opening the board or archived reports.
+You may reject a lead, reproduce it through a clean setup, revise it, or start
+a new branch. Record each challenge and its evidence in `peer-arguments.md`.
+Do not edit another participant's files or the shared board.
 
 The coordinator assigns later-round sessions from the unresolved leads. If you
 receive an assigned Lead ID, investigate that exact lead first: independently
@@ -131,16 +152,42 @@ challenged, independently confirmed, rejected, unresolved, and any concrete
 follow-up task another participant should take. State `Round status: quiescent`
 only if no actionable lead or evidence task remains. Do not hide failed
 experiments, incomplete work, or uncertainty.
+Include `Audit outcome: positive | negative | inconclusive | duplicate` so
+negative and incomplete work remains searchable in the event index.
+
+Write one JSON object per line for each meaningful interaction in
+`SWARM_EVENTS.jsonl`. Use schema_version 1 and the fields `action` (CLAIM,
+CHALLENGE, TEST, REVISE, RETRACT, or EXPLORE), `board_version_seen`, optional
+`task`, `lead_id`, `evidence_refs` (workspace-relative artifact paths),
+`outcome`, `evidence_state`, `independent_execution`,
+`independent_analysis`, `information_gain` (boolean), and `detail`. Events are
+your reported actions; the coordinator records them as agent-reported evidence
+and preserves the original file. Do not invent evidence references.
+Include `code_areas` as relative Linux source paths or named subsystems when the
+event concerns a specific area. Use `claim_id` and `target_claim` to connect
+claims and challenges; include `objection` and `proposed_test` for challenges.
 
 For a coordinator-assigned challenge, also include these machine-readable lines
 in `SWARM_UPDATE.md`:
 - `Assigned Lead ID: <stable-id>`
+- `Claim ID: <stable-id for this challenge claim>`
+- `Target claim ID: <claim being challenged, or none>`
 - `Lead challenge disposition: upheld | rejected | unresolved`
 - `Independent reproduction: confirmed | failed | not-run`
+- `Independent analysis: completed | not-run`
+- `Evidence progress: new | none`
+- `Evidence refs: <comma-separated artifact paths or none>`
+- `Disputed claim: <specific claim or none>`
+- `Falsifiable check: <test or source check that could disprove it>`
+- `Explored areas: <comma-separated Linux source paths or subsystems>`
+- `Suggested follow-up task: <concrete evidence gap for a future peer, or none>`
 Use `rejected` only when source tracing or a
 controlled experiment falsifies the lead's central claim; otherwise use
-`unresolved`. Two distinct peers must reject the same lead before the
-coordinator stops scheduling further challenges for it.
+`unresolved`. Include an evidence reference for `upheld`, `rejected`, or
+`Evidence progress: new`. A failed local reproduction caused by an environment
+or setup problem is `unresolved`, not `rejected`. Two distinct peers with
+evidence-backed rejections stop challenge scheduling; repeated follow-ups with
+no new evidence may suspend a lead without rejecting it.
 "#;
 
 pub(super) struct CandidateRunOutcome {
@@ -182,6 +229,8 @@ struct PreparedSession {
     name: String,
     agent_name: String,
     round: usize,
+    board_version_seen: usize,
+    blind_challenge: bool,
     workspace: PathBuf,
     scratch_dir: PathBuf,
     prompt: String,
@@ -217,11 +266,13 @@ pub(super) struct SwarmRunRequest<'a, 'b> {
     pub(super) agent_count: usize,
     pub(super) round_count: usize,
     pub(super) keep_workspace: bool,
+    pub(super) norm_set: &'a SwarmNormSet,
+    pub(super) verifier: Option<&'a Path>,
 }
 
 pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<CandidateRunOutcome> {
-    if !(2..=10).contains(&request.agent_count) {
-        bail!("swarm agent count must be between 2 and 10");
+    if !(2..=16).contains(&request.agent_count) {
+        bail!("swarm agent count must be between 2 and 16");
     }
     if !(1..=4).contains(&request.round_count) {
         bail!("swarm round count must be between 1 and 4");
@@ -233,7 +284,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         .with_context(|| format!("creating swarm workspace root {}", agents_dir.display()))?;
     fs::write(
         agents_dir.join("README.md"),
-        "# Swarm workspaces\n\nEvery agent is a peer. Round 1 starts independently; later rounds receive `SWARM_BOARD.md` and are dynamically assigned to unresolved leads or fresh discovery. No reviewer role is assigned. Follow-up sessions use new participant IDs. Each round has isolated persistent artifact workspaces and event/usage logs. A dedicated `scratch/` directory holds temporary builds and images; it is removed after that round's findings are archived unless `--keep-workspace` is set. Reports, logs, PoCs, and reproduction evidence stay in the persistent workspaces.\n",
+        "# Swarm workspaces\n\nEvery agent is a peer. Round 1 starts independently; later rounds receive a bounded, task-specific `SWARM_CONTEXT.md` and are dynamically assigned to evidence gaps or fresh discovery. No reviewer role is assigned. Follow-up sessions use new participant IDs. Each round has isolated persistent artifact workspaces and event/usage logs. A dedicated `scratch/` directory holds temporary builds and images; it is removed after that round's findings are archived unless `--keep-workspace` is set. Reports, logs, PoCs, and reproduction evidence stay in the persistent workspaces.\n",
     )
     .with_context(|| format!("writing swarm guide in {}", agents_dir.display()))?;
 
@@ -246,14 +297,18 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         ),
     )
     .with_context(|| format!("creating swarm board {}", board_path.display()))?;
+    write_norm_manifest(&candidate_dir.join("SWARM_NORMS.json"), request.norm_set)?;
 
     fs::write(
         candidate_dir.join("prompt.md"),
         format!(
-            "# Peer swarm audit\n\n`--count 1` schedules one swarm group with up to {} parallel peers per round and up to {} shared-board rounds. The first round discovers independently; later rounds dynamically assign new peers to unresolved leads while keeping a fresh-discovery slot. There is no finding count limit, and actual session count may be lower than the maximum. Individual prompts and evidence are in `agents/`.\n\nShared board: {}\n",
+            "# Peer swarm audit\n\n`--count 1` schedules one swarm group with up to {} parallel peers per round and up to {} shared-board rounds. The first round discovers independently; later rounds adapt the fresh-exploration share between {}% and {}% based on the actionable lead queue, then allocate remaining sessions by evidence gap. There is no finding count limit, and actual session count may be lower than the maximum. Individual prompts and evidence are in `agents/`.\n\nShared board: {}\nNorm set: SWARM_NORMS.json (version {})\n",
             request.agent_count,
             request.round_count,
-            board_path.display()
+            request.norm_set.resource_policy.exploration_min_percent,
+            request.norm_set.resource_policy.exploration_max_percent,
+            board_path.display(),
+            request.norm_set.version
         ),
     )
     .with_context(|| format!("writing swarm prompt in {}", candidate_dir.display()))?;
@@ -271,6 +326,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
                 let assignment = PeerAssignment {
                     agent_name: format!("agent-{next_participant:02}"),
                     task: PeerTask::Discovery,
+                    context: "Dry-run preview. At execution time, runtime evidence determines the task-specific context.".to_string(),
                 };
                 next_participant += 1;
                 let agent_name = &assignment.agent_name;
@@ -307,12 +363,16 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
     append_log(
         &process_log,
         &format!(
-            "\n#### candidate-{:03} peer swarm\n\n- Maximum parallel peers per round: {}\n- Maximum shared-board rounds: {}\n- Maximum possible child sessions: {maximum_session_count}; follow-up rounds are dynamically staffed and may stop early.\n- Keep per-agent scratch workspaces: {}\n- No permanent reviewer; every participant may discover, argue, reproduce, reject, and branch.\n- Shared argument board: {}\n",
+            "\n#### candidate-{:03} peer swarm\n\n- Maximum parallel peers per round: {}\n- Maximum shared-board rounds: {}\n- Maximum possible child sessions: {maximum_session_count}; follow-up rounds are dynamically staffed and may stop early.\n- Fresh-exploration share adapts between {}% and {}% of follow-up sessions using the frozen norm policy.\n- Norm set version: {}; the run uses a frozen policy.\n- Keep per-agent scratch workspaces: {}\n- No permanent reviewer; every participant may discover, argue, reproduce, reject, and branch.\n- Shared argument board: {}\n- Structured interaction log: {}\n",
             request.candidate_index,
             request.agent_count,
             request.round_count,
+            request.norm_set.resource_policy.exploration_min_percent,
+            request.norm_set.resource_policy.exploration_max_percent,
+            request.norm_set.version,
             request.keep_workspace,
-            board_path.display()
+            board_path.display(),
+            candidate_dir.join("SWARM_EVENTS.jsonl").display()
         ),
     )?;
 
@@ -327,7 +387,8 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
     let mut failing_status = None;
     let mut any_spawn_failure = false;
     let mut errors = Vec::new();
-    let mut rejected_leads = LeadRejections::new();
+    let mut lead_history = LeadHistory::new();
+    let mut interaction_log = SwarmEventLog::create(&candidate_dir.join("SWARM_EVENTS.jsonl"))?;
     let mut next_participant = 1;
     let mut completed_round_count = 0;
 
@@ -335,11 +396,46 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         let assignments = if round == 1 {
             initial_round(request.agent_count)
         } else {
+            let prior_outcomes = interaction_log
+                .events()
+                .iter()
+                .filter(|event| {
+                    event.action == "NON_POSITIVE_OUTCOME"
+                        || (event.action == "CHALLENGE"
+                            && matches!(event.outcome.as_deref(), Some("rejected" | "unresolved")))
+                })
+                .take(21)
+                .map(|event| {
+                    format!(
+                        "{} {:?} (lead: {}); evidence: {}",
+                        event.outcome.as_deref().unwrap_or("unresolved"),
+                        event.task.as_deref().unwrap_or("task"),
+                        event.lead_id.as_deref().unwrap_or("none"),
+                        if event.evidence_refs.is_empty() {
+                            "SWARM_UPDATE.md".to_string()
+                        } else {
+                            event.evidence_refs.join(", ")
+                        }
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut covered_area_set = BTreeSet::new();
+            let covered_areas = interaction_log
+                .events()
+                .iter()
+                .filter(|event| event.action == "COVERAGE_RECORDED")
+                .flat_map(|event| event.code_areas.iter())
+                .filter(|area| covered_area_set.insert(area.to_ascii_lowercase()))
+                .cloned()
+                .collect::<Vec<_>>();
             argument_round(
                 &findings,
-                &rejected_leads,
+                &lead_history,
+                &prior_outcomes,
+                &covered_areas,
                 request.agent_count,
                 next_participant,
+                request.norm_set,
             )
         };
         let sessions = assignments
@@ -361,14 +457,50 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
             })
             .collect::<Result<Vec<_>>>()?;
         next_participant += assignments.len();
+        for (assignment, session) in assignments.iter().zip(&sessions) {
+            let (task, lead_id, detail) = match &assignment.task {
+                PeerTask::Discovery => ("explore", None, "fresh source discovery".to_string()),
+                PeerTask::Followup {
+                    lead,
+                    blind_challenge,
+                } => (
+                    "challenge",
+                    Some(lead.lead_id.clone()),
+                    if *blind_challenge {
+                        "blind source-based challenge".to_string()
+                    } else {
+                        "focused evidence-gap challenge".to_string()
+                    },
+                ),
+            };
+            let mut event = EventDraft::new(
+                round,
+                Some(&assignment.agent_name),
+                session.board_version_seen,
+                "TASK_ASSIGNED",
+            );
+            event.task = Some(task.to_string());
+            event.lead_id = lead_id;
+            event.detail = Some(detail);
+            interaction_log.append_coordinator(event)?;
+        }
         let task_summary = assignments
             .iter()
             .map(|assignment| match &assignment.task {
                 PeerTask::Discovery => format!("{}: fresh discovery", assignment.agent_name),
-                PeerTask::Followup(lead) => {
+                PeerTask::Followup {
+                    lead,
+                    blind_challenge,
+                } => {
                     format!(
-                        "{}: challenge Lead ID {}",
-                        assignment.agent_name, lead.lead_id
+                        "{}: {} Lead ID {}",
+                        assignment.agent_name,
+                        if *blind_challenge {
+                            "blind challenge"
+                        } else {
+                            "challenge"
+                        },
+                        lead.lead_id,
                     )
                 }
             })
@@ -418,6 +550,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
                         result
                             .status
                             .as_ref()
+                            .copied()
                             .map(status_label)
                             .unwrap_or_else(|| "unavailable".to_string())
                     )
@@ -432,6 +565,81 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
             }
             round_results.push(result);
         }
+        for (assignment, session) in assignments.iter().zip(&sessions) {
+            let assigned_lead_id = match &assignment.task {
+                PeerTask::Discovery => None,
+                PeerTask::Followup { lead, .. } => Some(lead.lead_id.as_str()),
+            };
+            interaction_log.import_agent_events(
+                &session.workspace.join("SWARM_EVENTS.jsonl"),
+                round,
+                &session.agent_name,
+                session.board_version_seen,
+                assigned_lead_id,
+            )?;
+            let update = read_challenge_update(&session.workspace.join("SWARM_UPDATE.md"));
+            if !update.explored_areas.is_empty() {
+                let mut event = EventDraft::new(
+                    round,
+                    Some(&session.agent_name),
+                    session.board_version_seen,
+                    "COVERAGE_RECORDED",
+                );
+                event.task = Some(match &assignment.task {
+                    PeerTask::Discovery => "explore".to_string(),
+                    PeerTask::Followup { .. } => "challenge".to_string(),
+                });
+                event.lead_id = assigned_lead_id.map(str::to_string);
+                event.code_areas = update.explored_areas;
+                event.detail = Some(
+                    "Source coverage declared in the session update; used as a redundancy hint."
+                        .to_string(),
+                );
+                interaction_log.append_coordinator(event)?;
+            }
+        }
+        for ((assignment, session), result) in assignments.iter().zip(&sessions).zip(&round_results)
+        {
+            let mut event = EventDraft::new(
+                round,
+                Some(&session.agent_name),
+                session.board_version_seen,
+                "SESSION_COMPLETED",
+            );
+            event.outcome = result
+                .usage
+                .finding_outcome
+                .clone()
+                .or_else(|| {
+                    read_challenge_update(&session.workspace.join("SWARM_UPDATE.md")).audit_outcome
+                })
+                .or_else(|| Some("unreported".to_string()));
+            event.task = Some(match &assignment.task {
+                PeerTask::Discovery => "explore".to_string(),
+                PeerTask::Followup { .. } => "challenge".to_string(),
+            });
+            event.elapsed_seconds = Some(result.usage.elapsed_seconds);
+            event.total_tokens = result.usage.token_usage.total_tokens;
+            event.evidence_refs = vec!["SWARM_UPDATE.md".to_string()];
+            if event.outcome.as_deref().is_some_and(|outcome| {
+                matches!(
+                    outcome.to_ascii_lowercase().as_str(),
+                    "negative" | "inconclusive" | "duplicate"
+                )
+            }) {
+                let mut non_positive = EventDraft::new(
+                    round,
+                    Some(&session.agent_name),
+                    session.board_version_seen,
+                    "NON_POSITIVE_OUTCOME",
+                );
+                non_positive.task = event.task.clone();
+                non_positive.outcome = event.outcome.clone();
+                non_positive.evidence_refs = event.evidence_refs.clone();
+                interaction_log.append_coordinator(non_positive)?;
+            }
+            interaction_log.append_coordinator(event)?;
+        }
         append_board_round(&board_path, round, &sessions)?;
         append_log(
             &process_log,
@@ -440,38 +648,252 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
                 round_timer.elapsed().as_secs_f64()
             ),
         )?;
-        findings.extend(archive_findings(
-            &sessions,
-            &findings_dir,
-            request.keep_workspace,
-        )?);
+        let previous_lead_evidence_counts = triage_leads(&findings)
+            .into_iter()
+            .map(|lead| (lead.key, lead.evidence_paths.len()))
+            .collect::<BTreeMap<_, _>>();
+        let round_findings = archive_findings(&sessions, &findings_dir, request.keep_workspace)?;
+        for finding in &round_findings {
+            let session = sessions
+                .iter()
+                .find(|session| session.agent_name == finding.agent_name)
+                .context("archived finding does not match a swarm session")?;
+            let mut event = EventDraft::new(
+                round,
+                Some(&finding.agent_name),
+                session.board_version_seen,
+                "FINDING_SUBMITTED",
+            );
+            event.lead_id = finding.lead_ids.iter().next().cloned();
+            event.claim_id = event.lead_id.clone();
+            event.evidence_refs = vec![
+                finding
+                    .path
+                    .strip_prefix(candidate_dir)
+                    .unwrap_or(&finding.path)
+                    .display()
+                    .to_string(),
+            ];
+            event.evidence_state = Some(if finding.locally_reproduced {
+                "AGENT_REPRODUCED".to_string()
+            } else {
+                "CANDIDATE".to_string()
+            });
+            event.independent_execution = Some(finding.locally_reproduced);
+            event.independent_analysis = Some(finding.independent_analysis);
+            interaction_log.append_coordinator(event)?;
+        }
+        findings.extend(round_findings);
+        for lead in triage_leads(&findings) {
+            let previous_count = previous_lead_evidence_counts
+                .get(&lead.key)
+                .copied()
+                .unwrap_or_default();
+            if lead.evidence_paths.len() <= previous_count {
+                continue;
+            }
+            let Some(state) = lead_history.get_mut(&lead.key) else {
+                continue;
+            };
+            let was_suspended = state.suspended;
+            state.suspended = false;
+            state.no_progress_rounds = 0;
+            if !was_suspended {
+                continue;
+            }
+            let mut event = EventDraft::new(round, None, round, "LEAD_REACTIVATED");
+            event.lead_id = Some(lead.lead_id.clone());
+            event.evidence_refs = lead
+                .evidence_paths
+                .iter()
+                .skip(previous_count)
+                .map(|path| {
+                    path.strip_prefix(candidate_dir)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            event.detail = Some(
+                "New archived finding evidence reopened a previously suspended lead for scheduling."
+                    .to_string(),
+            );
+            interaction_log.append_coordinator(event)?;
+            append_log(
+                &process_log,
+                &format!(
+                    "- Lead ID {} reactivated after new archived evidence; it is eligible for follow-up scheduling.\n",
+                    lead.lead_id
+                ),
+            )?;
+        }
         for session in &sessions {
             record_session_scratch_cleanup(session, request.keep_workspace, &process_log)?;
         }
-        for (assignment, session) in assignments.iter().zip(&sessions) {
-            let PeerTask::Followup(lead) = &assignment.task else {
+        let mut followup_reproductions = Vec::new();
+        for ((assignment, session), result) in assignments.iter().zip(&sessions).zip(&round_results)
+        {
+            let PeerTask::Followup {
+                lead,
+                blind_challenge,
+            } = &assignment.task
+            else {
                 continue;
             };
-            if session_rejects_assigned_lead(session, &lead.lead_id) {
-                let peers = rejected_leads.entry(lead.key.clone()).or_default();
-                if peers.insert(assignment.agent_name.clone()) {
-                    append_log(
-                        &process_log,
-                        &format!(
-                            "- {} rejected assigned Lead ID {}; {} independent peer rejection(s) recorded.\n",
-                            assignment.agent_name,
-                            lead.lead_id,
-                            peers.len()
-                        ),
-                    )?;
-                }
+            let update = read_challenge_update(&session.workspace.join("SWARM_UPDATE.md"));
+            let assigned_lead_matches = update.assigned_lead_id.as_deref().is_some_and(|lead_id| {
+                normalize_swarm_field(lead_id) == normalize_swarm_field(&lead.lead_id)
+            });
+            let (evidence_refs, invalid_refs) = if assigned_lead_matches {
+                validate_evidence_refs(&session.workspace, &update.evidence_refs)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            if !invalid_refs.is_empty() {
+                let mut event = EventDraft::new(
+                    round,
+                    Some(&assignment.agent_name),
+                    session.board_version_seen,
+                    "INVALID_EVIDENCE_REFS",
+                );
+                event.lead_id = Some(lead.lead_id.clone());
+                event.evidence_refs = invalid_refs;
+                event.detail = Some(
+                    "Rejected evidence references that were absent, absolute, or outside the participant workspace."
+                        .to_string(),
+                );
+                interaction_log.append_coordinator(event)?;
+            }
+            let disposition = assigned_lead_matches
+                .then_some(update.disposition.as_deref())
+                .flatten();
+            let information_gain = assigned_lead_matches
+                .then_some(update.information_gain)
+                .flatten();
+            let independent_analysis = *blind_challenge
+                && assigned_lead_matches
+                && update.independent_analysis
+                && session.workspace.join("blind-analysis.md").is_file();
+            let independent_reproduction = assigned_lead_matches
+                && update.independent_reproduction.as_deref() == Some("confirmed")
+                && !evidence_refs.is_empty();
+            if assigned_lead_matches
+                && (update.disputed_claim.is_none() || update.falsifiable_check.is_none())
+            {
+                let mut event = EventDraft::new(
+                    round,
+                    Some(&assignment.agent_name),
+                    session.board_version_seen,
+                    "NORM_SOFT_VIOLATION",
+                );
+                event.lead_id = Some(lead.lead_id.clone());
+                event.outcome = Some("N3_PRODUCTIVE_CHALLENGE".to_string());
+                event.detail = Some(
+                    "Challenge omitted a machine-readable disputed claim or falsifiable check."
+                        .to_string(),
+                );
+                interaction_log.append_coordinator(event)?;
+            }
+            if independent_reproduction && let Some(reference) = evidence_refs.first() {
+                followup_reproductions.push(archived_followup_reproduction(
+                    &assignment.agent_name,
+                    lead,
+                    independent_analysis,
+                    session.workspace.join(reference),
+                ));
+            }
+            let (no_progress_rounds, suspended) = update_followup_state(
+                &mut lead_history,
+                lead,
+                FollowupUpdate {
+                    participant: &assignment.agent_name,
+                    disposition,
+                    evidence_refs: &evidence_refs,
+                    information_gain,
+                    independent_analysis,
+                    suggested_task: assigned_lead_matches
+                        .then_some(update.suggested_task.as_deref())
+                        .flatten(),
+                    evidence_tokens: result.usage.token_usage.total_tokens.unwrap_or_default(),
+                    elapsed_seconds: result.usage.elapsed_seconds,
+                    suspend_after_no_progress: request
+                        .norm_set
+                        .resource_policy
+                        .suspend_after_no_progress,
+                },
+            );
+            let mut event = EventDraft::new(
+                round,
+                Some(&assignment.agent_name),
+                session.board_version_seen,
+                "CHALLENGE",
+            );
+            event.task = Some(if *blind_challenge {
+                "blind challenge".to_string()
+            } else {
+                "focused challenge".to_string()
+            });
+            event.lead_id = Some(lead.lead_id.clone());
+            event.claim_id = update
+                .claim_id
+                .clone()
+                .or_else(|| Some(format!("{}:{}", lead.lead_id, assignment.agent_name)));
+            event.target_claim = update.target_claim_id.clone();
+            event.objection = update.disputed_claim.clone();
+            event.proposed_test = update.falsifiable_check.clone();
+            event.evidence_refs = evidence_refs;
+            let challenge_evidence_refs = event.evidence_refs.clone();
+            event.outcome = disposition.map(str::to_string);
+            event.independent_execution = Some(independent_reproduction);
+            event.independent_analysis = Some(independent_analysis);
+            event.information_gain = information_gain;
+            event.detail = Some(format!(
+                "{no_progress_rounds} consecutive no-progress follow-up(s)"
+            ));
+            interaction_log.append_coordinator(event)?;
+            if disposition.is_some_and(|value| value.eq_ignore_ascii_case("rejected"))
+                && !challenge_evidence_refs.is_empty()
+            {
+                let rejection_count = lead_history
+                    .get(&lead.key)
+                    .map_or(0, |state| state.rejected_agents.len());
+                append_log(
+                    &process_log,
+                    &format!(
+                        "- {} rejected assigned Lead ID {} with evidence; {} independent peer rejection(s) recorded.\n",
+                        assignment.agent_name, lead.lead_id, rejection_count
+                    ),
+                )?;
+            }
+            if suspended {
+                let mut event = EventDraft::new(
+                    round,
+                    Some(&assignment.agent_name),
+                    session.board_version_seen,
+                    "LEAD_SUSPENDED",
+                );
+                event.lead_id = Some(lead.lead_id.clone());
+                event.evidence_refs = challenge_evidence_refs.clone();
+                event.detail = Some(format!(
+                    "{} consecutive follow-ups reported no evidence progress; the lead remains unresolved and indexed.",
+                    request.norm_set.resource_policy.suspend_after_no_progress
+                ));
+                interaction_log.append_coordinator(event)?;
+                append_log(
+                    &process_log,
+                    &format!(
+                        "- Lead ID {} suspended after {} follow-ups without evidence progress; it remains unresolved in SWARM_INDEX.json.\n",
+                        lead.lead_id, request.norm_set.resource_policy.suspend_after_no_progress
+                    ),
+                )?;
             }
         }
+        findings.extend(followup_reproductions);
         let quiescent = sessions.iter().all(session_declares_quiescence);
         records.extend(round_results.into_iter().map(|result| result.usage));
         all_sessions.extend(sessions);
         completed_round_count = round;
-        let pending_leads = has_actionable_leads(&findings, &rejected_leads);
+        let pending_leads = has_actionable_leads(&findings, &lead_history);
         if quiescent && !pending_leads && round < request.round_count {
             println!(
                 "[kernel-vuln] candidate {:03}: swarm reached quiescence after round {round}; stopping early",
@@ -487,7 +909,72 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
         }
     }
 
-    apply_peer_confirmation_gate(&mut findings)?;
+    classify_peer_evidence(&mut findings)?;
+    for lead in triage_leads(&findings) {
+        let evidence_state = match lead.reproduced_participant_count {
+            0 => "CANDIDATE",
+            1 => "AGENT_REPRODUCED",
+            _ => "CROSS_REPRODUCED",
+        };
+        let mut event = EventDraft::new(
+            completed_round_count,
+            None,
+            completed_round_count,
+            "EVIDENCE_CLASSIFIED",
+        );
+        event.lead_id = Some(lead.lead_id.clone());
+        event.evidence_refs = lead
+            .evidence_paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(candidate_dir)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        event.evidence_state = Some(evidence_state.to_string());
+        event.independent_execution = Some(lead.reproduced_participant_count > 0);
+        event.independent_analysis = Some(lead.independent_analysis_count > 0);
+        event.detail = Some(format!(
+            "{} distinct local executions; {} archived submissions with independent analysis before shared evidence",
+            lead.reproduced_participant_count, lead.independent_analysis_count
+        ));
+        interaction_log.append_coordinator(event)?;
+    }
+    let verifier_scratch = candidate_dir.join("scratch");
+    let candidate_leads = triage_leads(&findings);
+    let verification_records = verify_leads(VerifyLeadsRequest {
+        runner: request.verifier,
+        candidate_dir,
+        scratch_root: &verifier_scratch,
+        linux_source: request.run_options.linux_path,
+        requested_revision: request.commit,
+        norm_version: request.norm_set.version,
+        leads: &candidate_leads,
+        keep_scratch: request.keep_workspace,
+    })
+    .await?;
+    for verification in &verification_records {
+        let mut event = EventDraft::new(
+            completed_round_count,
+            None,
+            completed_round_count,
+            "RUNNER_VERIFICATION",
+        );
+        event.lead_id = Some(verification.lead_id.clone());
+        event.outcome = Some(verification.status.clone());
+        event.evidence_state = Some(verification.status.clone());
+        event.evidence_refs = verification.evidence_refs.clone();
+        event.vm_queue_seconds = verification
+            .vm_queue_seconds
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0);
+        event.vm_execution_seconds = verification
+            .vm_execution_seconds
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0);
+        event.detail = Some(verification.detail.clone());
+        interaction_log.append_coordinator(event)?;
+    }
     let actual_session_count = all_sessions.len();
     let all_sessions_negative = records.iter().all(|record| {
         record
@@ -511,8 +998,27 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
             max_parallel_agents: request.agent_count,
             participant_count: actual_session_count,
             round_count: completed_round_count,
-            rejected_leads: &rejected_leads,
+            lead_history: &lead_history,
         },
+    )?;
+    add_verification_to_reports(candidate_dir, &findings, &verification_records)?;
+    write_swarm_index(
+        candidate_dir,
+        &findings,
+        &lead_history,
+        completed_round_count,
+        interaction_log.events(),
+        request.norm_set.version,
+        &verification_records,
+    )?;
+    write_norm_review(
+        &candidate_dir.join("SWARM_NORM_REVIEW.md"),
+        interaction_log.events(),
+        request.norm_set,
+    )?;
+    write_evaluation_template(
+        &candidate_dir.join("SWARM_NORM_FEEDBACK_TEMPLATE.json"),
+        request.norm_set,
     )?;
 
     let token_usage = aggregate_token_usage(
@@ -564,7 +1070,7 @@ pub(super) async fn run_candidate(request: SwarmRunRequest<'_, '_>) -> Result<Ca
     })
 }
 
-fn status_label(status: &ExitStatus) -> String {
+fn status_label(status: ExitStatus) -> String {
     status
         .code()
         .map(|code| format!("exit code {code}"))
@@ -582,11 +1088,31 @@ fn prepare_session(
     let agent_name = assignment.agent_name.as_str();
     fs::create_dir_all(workspace)
         .with_context(|| format!("creating agent workspace {}", workspace.display()))?;
+    fs::copy(
+        request.candidate_dir.join("SWARM_NORMS.json"),
+        workspace.join("SWARM_NORMS.json"),
+    )
+    .with_context(|| format!("copying frozen norms into {}", workspace.display()))?;
+    let source_index = request.run_options.output_dir.join(FINDING_INDEX_FILE_NAME);
+    let session_index = workspace.join(FINDING_INDEX_FILE_NAME);
+    if source_index.is_file() {
+        fs::copy(&source_index, &session_index)
+            .with_context(|| format!("copying prior finding index into {}", workspace.display()))?;
+    } else {
+        fs::write(
+            &session_index,
+            "# Prior finding index\n\nNo earlier candidate index was available.\n",
+        )
+        .with_context(|| format!("writing session finding index in {}", workspace.display()))?;
+    }
     let scratch_dir = workspace.join("scratch");
+    let context_path = workspace.join("SWARM_CONTEXT.md");
+    fs::write(&context_path, &assignment.context)
+        .with_context(|| format!("writing task context in {}", workspace.display()))?;
     let mut prompt = if let Some(review) = request.rule_review {
         render_rule_review_prompt(
             request.run_options.linux_path,
-            request.run_options.output_dir,
+            workspace,
             workspace,
             &scratch_dir,
             request.focus,
@@ -596,7 +1122,7 @@ fn prepare_session(
     } else {
         render_prompt(
             request.run_options.linux_path,
-            request.run_options.output_dir,
+            workspace,
             workspace,
             &scratch_dir,
             request.focus,
@@ -616,18 +1142,41 @@ fn prepare_session(
             .parse::<usize>()
             .unwrap_or(1))
         % ROTATING_RESEARCH_LENSES.len();
+    let blind_challenge = matches!(
+        &assignment.task,
+        PeerTask::Followup {
+            blind_challenge: true,
+            ..
+        }
+    );
+    let shared_context_hint = if blind_challenge {
+        "This is a blind challenge. The task context contains only the lead ID and title; record independent analysis before opening prior reports."
+            .to_string()
+    } else {
+        format!(
+            "The full board is at `{}`; use the task context to select relevant records",
+            board_path.display()
+        )
+    };
+    let induced_guidance = request
+        .norm_set
+        .update_record
+        .as_ref()
+        .map(|record| record.induced_guidance.join("; "))
+        .filter(|guidance| !guidance.is_empty())
+        .unwrap_or_else(|| "none; use the base role-independent norms".to_string());
     let swarm_instructions = SWARM_CONTRACT
         .replace("{round}", &round.to_string())
         .replace("{round_count}", &request.round_count.to_string())
         .replace("{agent_name}", agent_name)
         .replace("{lens}", ROTATING_RESEARCH_LENSES[lens_index])
-        .replace(
-            "{candidate_dir}",
-            &request.candidate_dir.display().to_string(),
-        )
+        .replace("{candidate_dir}", &workspace.display().to_string())
         .replace("{workspace}", &workspace.display().to_string())
         .replace("{scratch_dir}", &scratch_dir.display().to_string())
-        .replace("{board_path}", &board_path.display().to_string());
+        .replace("{context_path}", &context_path.display().to_string())
+        .replace("{shared_context_hint}", &shared_context_hint)
+        .replace("{induced_guidance}", &induced_guidance)
+        .replace("{norm_version}", &request.norm_set.version.to_string());
     prompt.push_str(&swarm_instructions);
     prompt.push_str("\n\n## Assigned round task\n\n");
     let task_label = match &assignment.task {
@@ -640,33 +1189,31 @@ fn prepare_session(
             "adaptive follow-up preview"
         }
         PeerTask::Discovery => {
-            prompt.push_str("Fresh discovery. Read the shared board, avoid already-covered root causes, and select an unexamined code area.\n");
+            prompt.push_str("Fresh discovery. Use the compact lead index in SWARM_CONTEXT.md to avoid already-covered root causes. Explore an unexamined code area and open full prior evidence only if your source path overlaps a listed lead.\n");
             "fresh discovery"
         }
-        PeerTask::Followup(lead) => {
-            let evidence_paths = lead
-                .evidence_paths
-                .iter()
-                .take(4)
-                .map(|path| format!("- `{}`", path.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let title = lead.title.chars().take(300).collect::<String>();
-            prompt.push_str(&format!(
-                "Independently challenge this unresolved lead before doing fresh discovery. Do not treat the prior report or local reproduction as proof of security impact.\n\n- Lead ID: `{}`\n- Reported title: {}\n- Existing participants: {}\n- Independent local reproductions: {}\n- Current security assessment: {}\n- Evidence archives:\n{}\n\nRe-read the source path, trigger assumptions, PoC, positive oracle, and closest negative control. Try to reproduce or falsify it from a clean setup. Determine whether the alleged behavior crosses a real security boundary under realistic attacker permissions. Record disagreements and failed reproduction attempts.\n",
-                lead.lead_id,
-                title,
-                lead.participant_count,
-                lead.reproduced_participant_count,
-                lead.security_impact.label(),
-                if evidence_paths.is_empty() {
-                    "- No archived evidence path was available yet.".to_string()
-                } else {
-                    evidence_paths
-                },
-            ));
+        PeerTask::Followup {
+            lead,
+            blind_challenge,
+        } => {
+            if *blind_challenge {
+                prompt.push_str(&format!(
+                    "Blindly challenge Lead ID `{}`. Use only the title and your source analysis in SWARM_CONTEXT.md until `blind-analysis.md` records your independently derived root cause and falsification plan. Then inspect the archived evidence, reproduce or falsify the behavior, and assess security impact.\n",
+                    lead.lead_id
+                ));
+            } else {
+                prompt.push_str(&format!(
+                    "Challenge Lead ID `{}` using the focused evidence in SWARM_CONTEXT.md. Re-read the source path and trigger assumptions, inspect the PoC, positive oracle, and closest negative control, then report what new evidence or counterexample you add. Assess security impact separately from reproducibility.\n",
+                    lead.lead_id
+                ));
+            }
             "assigned lead challenge"
         }
+    };
+    let board_version_seen = if blind_challenge {
+        0
+    } else {
+        round.saturating_sub(1)
     };
 
     let args = build_child_args(
@@ -674,7 +1221,7 @@ fn prepare_session(
         request.run_options,
         &scratch_dir,
         workspace,
-        &[request.candidate_dir, request.run_options.output_dir],
+        &[],
     );
     fs::write(workspace.join("prompt.md"), &prompt)
         .with_context(|| format!("writing agent prompt in {}", workspace.display()))?;
@@ -686,8 +1233,9 @@ fn prepare_session(
     fs::write(
         workspace.join("run-metadata.md"),
         format!(
-            "# Swarm session metadata\n\n- role: equal peer researcher\n- task: {task_label}\n- participant: {agent_name}\n- round: {round}/{}\n- audit group: candidate-{:03}\n- persistent workspace: {}\n- scratch directory: {}\n- keep scratch after run: {}\n- Linux source: {}\n- model: {}\n- API key variable: {} (value redacted)\n- API base URL: {}\n- sandbox: {}\n- prompt: prompt.md\n- command: command.txt\n- event log: agent-events.jsonl\n- stderr log: agent-stderr.log\n- usage summary: usage.json\n",
+            "# Swarm session metadata\n\n- role: equal peer researcher\n- task: {task_label}\n- participant: {agent_name}\n- round: {round}/{}\n- board version seen: {}\n- audit group: candidate-{:03}\n- persistent workspace: {}\n- scratch directory: {}\n- keep scratch after run: {}\n- Linux source: {}\n- model: {}\n- API key variable: {} (value redacted)\n- API base URL: {}\n- sandbox: {}\n- prompt: prompt.md\n- task context: SWARM_CONTEXT.md\n- structured interaction events: SWARM_EVENTS.jsonl\n- Codex event log: agent-events.jsonl\n- stderr log: agent-stderr.log\n- usage summary: usage.json\n",
             request.round_count,
+            board_version_seen,
             request.candidate_index,
             workspace.display(),
             scratch_dir.display(),
@@ -708,6 +1256,8 @@ fn prepare_session(
         name: session_name.to_string(),
         agent_name: agent_name.to_string(),
         round,
+        board_version_seen,
+        blind_challenge,
         workspace: workspace.to_path_buf(),
         scratch_dir,
         prompt,
@@ -793,7 +1343,10 @@ fn complete_session(
         Err(error) => (None, Some(format!("{error:#}")), "failed_to_start", None),
     };
     let token_usage = read_token_usage(&session.workspace.join("agent-events.jsonl"))?;
-    let finding_outcome = read_finding_outcome(&session.workspace.join("finding-fingerprint.md"));
+    let finding_outcome = read_finding_outcome(&session.workspace.join("finding-fingerprint.md"))
+        .or_else(|| {
+            read_challenge_update(&session.workspace.join("SWARM_UPDATE.md")).audit_outcome
+        });
     let usage = CandidateUsageRecord {
         run_started_at: request.run_started_at.to_string(),
         candidate: format!(
@@ -872,41 +1425,6 @@ fn session_declares_quiescence(session: &PreparedSession) -> bool {
     })
 }
 
-fn session_rejects_assigned_lead(session: &PreparedSession, expected_lead_id: &str) -> bool {
-    let Ok(update) = fs::read_to_string(session.workspace.join("SWARM_UPDATE.md")) else {
-        return false;
-    };
-    let mut assigned_lead_id = None;
-    let mut rejected = false;
-    for line in update.lines() {
-        let Some((key, value)) = line
-            .trim()
-            .trim_start_matches(['-', '*', ' ', '`'])
-            .split_once(':')
-        else {
-            continue;
-        };
-        let key = normalize_swarm_field(key);
-        let value = value.trim().trim_matches(['`', '*', ' ']);
-        if key == "assignedleadid" {
-            assigned_lead_id = Some(normalize_swarm_field(value));
-        } else if key == "leadchallengeddisposition" {
-            rejected = value.to_ascii_lowercase().starts_with("rejected");
-        }
-    }
-    rejected
-        && assigned_lead_id
-            .is_some_and(|lead_id| lead_id == normalize_swarm_field(expected_lead_id))
-}
-
-fn normalize_swarm_field(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
 fn read_bounded_file(path: &Path, max_chars: usize) -> String {
     let Ok(contents) = fs::read_to_string(path) else {
         return String::new();
@@ -970,6 +1488,7 @@ fn archive_findings(
             write_evidence_pointer(&dest, &source, keep_workspace)?;
             archived.push(archived_finding(
                 &session.agent_name,
+                session_has_independent_analysis(session),
                 dest,
                 &root_fingerprint,
                 &root_report,
@@ -1010,11 +1529,20 @@ fn archive_finding_folder(
     write_evidence_pointer(&dest, &session.workspace, keep_workspace)?;
     archived.push(archived_finding(
         &session.agent_name,
+        session_has_independent_analysis(session),
         dest,
         &fingerprint,
         &report,
     )?);
     Ok(())
+}
+
+fn session_has_independent_analysis(session: &PreparedSession) -> bool {
+    session.round == 1
+        || (session.blind_challenge
+            && read_challenge_update(&session.workspace.join("SWARM_UPDATE.md"))
+                .independent_analysis
+            && session.workspace.join("blind-analysis.md").is_file())
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -1060,7 +1588,7 @@ struct CandidateSummaryContext<'a> {
     max_parallel_agents: usize,
     participant_count: usize,
     round_count: usize,
-    rejected_leads: &'a LeadRejections,
+    lead_history: &'a LeadHistory,
 }
 
 fn write_candidate_summary(
@@ -1075,7 +1603,7 @@ fn write_candidate_summary(
         max_parallel_agents,
         participant_count,
         round_count,
-        rejected_leads,
+        lead_history,
     } = context;
     let groups = group_findings(findings);
     let lead_triage = triage_leads(findings);
@@ -1088,10 +1616,22 @@ fn write_candidate_summary(
         report.push_str("## Findings\n\n");
         for (index, (group, lead)) in groups.iter().zip(&lead_triage).enumerate() {
             let finding = group[0];
-            let outcome = if group
-                .iter()
-                .any(|finding| finding.swarm_outcome.eq_ignore_ascii_case("confirmed"))
-            {
+            let evidence_state = if group.iter().any(|finding| {
+                finding
+                    .swarm_outcome
+                    .eq_ignore_ascii_case("cross_reproduced")
+            }) {
+                "CROSS_REPRODUCED"
+            } else if group.iter().any(|finding| {
+                finding
+                    .swarm_outcome
+                    .eq_ignore_ascii_case("agent_reproduced")
+            }) {
+                "AGENT_REPRODUCED"
+            } else {
+                "CANDIDATE"
+            };
+            let legacy_outcome = if evidence_state == "CROSS_REPRODUCED" {
                 "confirmed"
             } else {
                 "plausible"
@@ -1128,11 +1668,21 @@ fn write_candidate_summary(
             } else {
                 SecurityImpactClass::Unresolved
             };
-            let rejection_count = rejected_leads
-                .get(&lead.key)
-                .map_or(0, std::collections::BTreeSet::len);
+            let state = lead_history.get(&lead.key);
+            let rejection_count = state.map_or(0, |state| state.rejected_agents.len());
+            let scheduling_state = if state.is_some_and(|state| state.suspended) {
+                "SUSPENDED"
+            } else if rejection_count >= 2 {
+                "REJECTED_BY_TWO_EVIDENCE_BACKED_CHALLENGES"
+            } else if lead.reproduced_participant_count >= 2
+                && lead.security_impact != SecurityImpactClass::Unresolved
+            {
+                "RESOLVED_FOR_SCHEDULING"
+            } else {
+                "ACTIVE"
+            };
             report.push_str(&format!(
-                "{}. **{}** (`Lead ID: {}`) — behavior consensus: `{outcome}`; security assessment: {}; challenged as rejected by {rejection_count} peer(s); submitted by `{agents}`; evidence archives: `{evidence_paths}`.\n",
+                "{}. **{}** (`Lead ID: {}`) — legacy outcome: `{legacy_outcome}`; evidence status: `{evidence_state}`; distinct participants reporting local execution: {}; archived submissions with independent analysis before shared evidence: {}; external runner verification: `NOT_RUN`; reportability review: `NOT_ASSESSED`; security assessment: {}; lead scheduling state: `{scheduling_state}` ({rejection_count} evidence-backed rejection(s)); submitted by `{agents}`; evidence archives: `{evidence_paths}`.\n",
                 index + 1,
                 if finding.title.trim().is_empty() {
                     "Untitled finding"
@@ -1140,18 +1690,21 @@ fn write_candidate_summary(
                     finding.title.as_str()
                 },
                 lead.lead_id,
+                lead.reproduced_participant_count,
+                lead.independent_analysis_count,
                 security_impact.label(),
             ));
         }
-        report.push_str("\nA swarm-level `confirmed` status means at least two distinct participants independently reported local reproduction for the same stable Lead ID (or a legacy normalized title/root-cause match). This confirms the reported behavior, not its security impact. The separate security assessment must be checked against each archived report and experiment.\n");
+        report.push_str("\n`CROSS_REPRODUCED` means two distinct participants reported local executions for the same Lead ID; it does not establish independent root-cause analysis or security impact. `RUNNER_VERIFIED`, `REPORTABLE`, and `SECURITY_CONFIRMED` are separate states and remain unset until their own checks occur. Positive, rejected, inconclusive, and suspended evidence is indexed in `SWARM_EVENTS.jsonl` and `SWARM_INDEX.json`.\n");
     }
     fs::write(candidate_dir.join("candidate-report.md"), &report)
         .with_context(|| format!("writing swarm report in {}", candidate_dir.display()))?;
 
-    let outcome = if findings
-        .iter()
-        .any(|finding| finding.swarm_outcome.eq_ignore_ascii_case("confirmed"))
-    {
+    let outcome = if findings.iter().any(|finding| {
+        finding
+            .swarm_outcome
+            .eq_ignore_ascii_case("cross_reproduced")
+    }) {
         "confirmed"
     } else if !findings.is_empty() {
         "plausible"
@@ -1163,13 +1716,20 @@ fn write_candidate_summary(
         "inconclusive"
     };
     let mut fingerprint = format!(
-        "Outcome: {outcome}\nTitle: {}\nSubsystem: multiple or not established\nAffected files/functions: see individual finding folders under findings/\nRoot cause/invariant: see individual finding folders under findings/\nUser-controlled trigger: see individual finding folders under findings/\nObservable oracle: see individual finding folders under findings/\nAffected revision: see source-status-before.txt\nDuplicate-of: none\n\nSwarm coverage: {participant_count} distinct peer participants, up to {max_parallel_agents} concurrent peers per round, {round_count} completed rounds; {} archived finding folders.\n",
+        "Outcome: {outcome}\nTitle: {}\nSubsystem: multiple or not established\nAffected files/functions: see individual finding folders under findings/\nRoot cause/invariant: see individual finding folders under findings/\nUser-controlled trigger: see individual finding folders under findings/\nObservable oracle: see individual finding folders under findings/\nAffected revision: see source-status-before.txt\nDuplicate-of: none\n\nSwarm coverage: {participant_count} distinct peer participants, up to {max_parallel_agents} concurrent peers per round, {round_count} completed rounds; {} archived finding folders.\nEvidence status: {}; external runner verification: NOT_RUN; reportability review: NOT_ASSESSED; security confirmation: NOT_ASSESSED.\n",
         if groups.is_empty() {
             "No validated finding"
         } else {
             "Peer swarm findings; see per-finding fingerprints"
         },
         groups.len(),
+        if outcome == "confirmed" {
+            "CROSS_REPRODUCED"
+        } else if outcome == "plausible" {
+            "CANDIDATE_OR_AGENT_REPRODUCED"
+        } else {
+            "NO_POSITIVE_FINDING"
+        },
     );
     if !all_sessions_succeeded {
         fingerprint.push_str("\nSome child sessions failed or omitted their final message; treat a no-finding result as inconclusive.\n");
