@@ -1,6 +1,6 @@
 # KScout：Linux 内核漏洞挖掘平台
 
-KScout 基于 Codex CLI 构建，用于审查 Linux 内核源码和提交历史、验证可疑缺陷，并保存可复核的报告、PoC 和实验记录。它提供单 agent、peer swarm 和可选的 CVE 派生规则审查模式。
+KScout 基于 Codex CLI 构建，用于审查 Linux 内核源码和提交历史、验证可疑缺陷，并保存可复核的报告、PoC 和实验记录。它提供单 agent、peer swarm 和可选的 CVE 派生规则审查模式。Swarm 使用无固定角色、由协调器调度的规范引导协作机制。
 
 KScout 仓库不包含 Linux 源码树。运行时请通过 `--linux-path` 指定本机 Linux checkout；下面的命令面向从仓库根目录启动的使用方式，不依赖某个固定的 clone 路径。
 
@@ -85,7 +85,7 @@ export PROVIDER_API_KEY='your-api-key'
 
 ### Peer swarm
 
-`--swarm` 把一个候选任务交给多个平等的 peer。第一轮并行独立挖掘；后续轮次根据已归档证据挑选未完成的 lead，安排新的 peer 独立复现或反驳，同时保留一个名额继续探索新方向。没有固定 reviewer，也不限制发现数量；最终结论仍须由源码路径、PoC、对照实验和日志证据支撑。
+`--swarm` 让多个平等 peer 分轮协作：首轮独立探索，后续按证据缺口挑战线索，同时为新方向保留资源。协调器记录交互轨迹和 Lead 状态，并使用版本化规范调度；Agent 共识不等于外部验证或安全结论。
 
 ```shell
 ./codex-rs/target/debug/codex kernel-vuln \
@@ -98,9 +98,7 @@ export PROVIDER_API_KEY='your-api-key'
   --show-progress
 ```
 
-默认第一轮 3 个 peer、最多 2 轮；一轮内并发、轮次之间顺序执行。后续轮按待办 lead 数量，将约 25%～40% 的 session 留给新方向，其余按证据缺口挑战不同 lead；没有待跟进 lead 时所有 session 都探索。首次跟进先进行盲式源码分析，反复没有新增证据的 lead 会暂停调度但保留记录。若 peer 全部报告无后续任务且没有待独立复现或待定安全影响的 lead，会提前结束。因此 `--count 1` 是一个 swarm 组，默认最多可用 6 个 child session，实际数量可能更少；日志会记录实际数量。`--swarm-agents` 设置每轮并发上限（2–16），`--swarm-rounds` 设置最多轮数（1–4）。
-
-跟进 lead 按证据缺口、影响分类、信息增益和历史 Token/时长成本排序。有效证据引用的 challenge 复现会进入跨 peer 计数。两名不同 peer 都提供证据并提交 `rejected` 后，该 lead 才会标记为 rejected；达到当前规范阈值的无进展议题会暂停，后续同根因新证据可重新激活。状态区分为 `CANDIDATE`、`AGENT_REPRODUCED`、`CROSS_REPRODUCED`；两个 peer 报告同一 Lead ID 的本地执行只构成 cross-reproduced，不代表独立根因分析或外部 runner 验证。`--swarm-verifier PATH` 可调用外部 VM 验证协议；协调器会检查结果结构、当前 Linux HEAD、配置摘要、重复正例、负对照、耗时和证据路径，但 VM 隔离仍由已配置的 verifier 实现。`--swarm-norms PATH` 加载冻结的版本策略；`--adapt-swarm-norms FEEDBACK.json --adapt-swarm-norms-output PATH` 根据等总预算的独立盲审反馈和 baseline/norm-guided 事件轨迹生成下一版，保留轨迹画像并归纳软规范建议。独立评审可在运行后用 `--apply-swarm-assessment ASSESSMENT.json` 记录 `REPORTABLE` 和 `SECURITY_CONFIRMED` 状态；Agent 共识不能设置这些终态。`SWARM_EVENTS.jsonl`、`SWARM_INDEX.json`、`SWARM_NORMS.json`、`SWARM_NORM_REVIEW.md`、`SWARM_REVIEW.json` 和 feedback template 保存事件、议题、评审和策略版本。`--prior-finding-index PATH` 可传入先前运行的 `FINDING_INDEX.md` 或其输出目录，重复该参数可导入多份索引，帮助不同输出目录之间排除重复根因。`--multi-agent` 仍是 `--swarm` 的兼容别名。是否改善发现效率和验证质量仍需按文档执行对照评估。
+默认每轮 3 个 peer、最多 2 轮；每轮 Agent 数支持 2–16，单次运行最多 64 个 child session。容量上限不代表已验证 10+ Agent 的效率收益。完整的调度、规范更新、证据状态和限制见[Norm-Guided Adaptive Swarm 当前工作机制](docs/norm-guided-adaptive-swarm.md)。`--multi-agent` 是 `--swarm` 的兼容别名。
 
 ### CVE 派生规则
 
@@ -174,6 +172,8 @@ CLI 正常退出或 fingerprint 写有 `confirmed`，都不能单独证明漏洞
 - [Linux 内核漏洞挖掘操作指南](docs/kernel-vuln-hunt.md)
 - [单 agent 实际工作流](docs/kernel-vuln-workflow.md)
 - [修改后的 Peer swarm 工作机制](SWARM_WORKFLOW.md)
+- [Peer swarm 工作流与验证边界](docs/kernel-vuln-swarm-workflow.md)
+- [Norm-Guided Adaptive Swarm 当前工作机制](docs/norm-guided-adaptive-swarm.md)
 - [CVE/CWE 索引](docs/kernel-cve-cwe-index.md)
 - [CVE 规则知识库](KERNEL_CVE_KNOWLEDGE.json)
 - [贡献指南](docs/contributing.md)
