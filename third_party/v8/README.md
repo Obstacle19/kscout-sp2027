@@ -70,8 +70,9 @@ their raw names:
 - `rusty_v8_ptrcomp_sandbox_release_<target>.lib.gz` on Windows MSVC
 - `src_binding_ptrcomp_sandbox_release_<target>.rs`
 
-The dedicated publishing workflow is `.github/workflows/rusty-v8-release.yml`.
-Tagged runs build release artifacts from the Bazel graph itself:
+The upstream Codex repository publishes these artifacts through its V8 release
+workflow. That publishing automation is omitted from this research snapshot.
+Upstream tagged runs build release artifacts from the Bazel graph itself:
 
 - `//third_party/v8:rusty_v8_release_pair_x86_64_apple_darwin`
 - `//third_party/v8:rusty_v8_release_pair_aarch64_apple_darwin`

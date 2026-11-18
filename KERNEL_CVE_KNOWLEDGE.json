@@ -30,7 +30,7 @@
     "pre_fix_signature_fixtures_matched": 17,
     "fixed_control_fixtures_checked": 17,
     "linux_tree_scan": {
-      "source_tree": "/root/workspace/linux",
+      "source_tree": "/path/to/linux",
       "source_revision": "fe2ec83746e501645709761605c2464a44fd2929",
       "scanned_c_and_h_files": 2791,
       "parsed_c_and_h_files": 2786,

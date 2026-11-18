@@ -1,6 +1,8 @@
 config:
-  MD013:
-    line_length: 100
+  MD013: false
 
 globs:
-  - "docs/tui-chat-composer.md"
+  - "README.md"
+  - "REPRODUCIBILITY.md"
+  - "SWARM_WORKFLOW.md"
+  - "docs/kernel-cve-cwe-index.md"

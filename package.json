@@ -1,10 +1,10 @@
 {
-  "name": "codex-monorepo",
+  "name": "kscout-research",
   "private": true,
-  "description": "Tools for repo-wide maintenance.",
+  "description": "Repository maintenance for the KScout research artifact.",
   "scripts": {
-    "format": "prettier --check *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
-    "format:fix": "prettier --write *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
+    "format": "prettier --check *.json *.md docs/*.md **/*.js",
+    "format:fix": "prettier --write *.json *.md docs/*.md **/*.js",
     "write-hooks-schema": "cargo run --manifest-path ./codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures"
   },
   "devDependencies": {

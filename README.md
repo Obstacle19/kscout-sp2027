@@ -1,96 +1,69 @@
-# KScout：Linux 内核漏洞挖掘平台
+# KScout
 
-KScout 基于 Codex CLI 构建，用于审查 Linux 内核源码和提交历史、验证可疑缺陷，并保存可复核的报告、PoC 和实验记录。它提供单 agent、peer swarm 和可选的 CVE 派生规则审查模式。Swarm 使用无固定角色、由协调器调度的规范引导协作机制。
+**Paradigm-Guided Multi-Agent Coordination for Operating System Kernel Vulnerability Discovery**
 
-KScout 仓库不包含 Linux 源码树。运行时请通过 `--linux-path` 指定本机 Linux checkout；下面的命令面向从仓库根目录启动的使用方式，不依赖某个固定的 clone 路径。
+KScout is a research framework for Linux kernel vulnerability discovery. It extends the Rust-based Codex agent harness with a coordinator that launches analysis sessions, assigns follow-up tasks, and preserves source analysis and execution evidence.
 
-## 快速开始
+The framework implements three collaboration paradigms:
 
-### 1. 构建 CLI
+- **Evidence-guided task allocation:** distribute agents between new searches and follow-up checks according to evidence gaps, progress, and cost.
+- **Evidence-grounded vulnerability analysis:** require independent source analysis, explicit claims, targeted checks, and traceable evidence.
+- **Cross-agent finding verification:** retain each participant's submissions and assess reproduction and security impact separately.
 
-构建需要 Rust 工具链；实际运行还需要可用的 Codex 模型/API 配置。仓库根目录下运行：
+Agents are peers without fixed investigative roles. KScout also supports a single-agent baseline and an optional CVE-derived rule mode.
 
-```shell
+## Requirements
+
+- A Linux research environment with Git, a native C/C++ build toolchain, and Rust installed through `rustup`. The Rust version is pinned in [rust-toolchain.toml](codex-rs/rust-toolchain.toml).
+- A separate Linux kernel source checkout. Kernel source, kernel build outputs, and VM images are not included in this repository.
+- For live analysis, access to a model backend supported by the bundled harness. Custom endpoints must support the Responses API used by the harness.
+- For kernel execution experiments, a disposable VM and the build tools required by the selected kernel configuration. The repository does not provision a VM automatically.
+
+Building the CLI downloads its locked dependencies and may download native runtime components. The offline smoke check below needs no model credentials after the CLI has been built.
+
+## Quick start
+
+Run these commands from the repository root. Always supply `--linux-path` explicitly.
+
+### Build
+
+```sh
 cd codex-rs
 cargo build --locked -p codex-cli --bin codex
 cd ..
 ```
 
-构建出的程序位于 `codex-rs/target/debug/codex`。
+The executable is `codex-rs/target/debug/codex`. Use this locally built executable for the KScout commands.
 
-### 2. 先生成 dry-run 产物
+### Check the workflow without calling a model
 
-`--dry-run` 会生成 prompt、命令和目录结构，不会启动模型会话：
+Replace `/path/to/linux` with an existing kernel source checkout:
 
-```shell
+```sh
 ./codex-rs/target/debug/codex kernel-vuln \
   --linux-path /path/to/linux \
-  --output-dir ./kscout-workdir \
+  --output-dir ./runs/smoke \
   --count 1 \
+  --swarm \
+  --swarm-agents 3 \
+  --swarm-rounds 2 \
   --dry-run
 ```
 
-把 `/path/to/linux` 换成本机 Linux 源码目录。建议始终显式传入 `--linux-path`，避免依赖不同机器上的默认路径。
+This prepares the run directories, prompts, and child commands without launching model sessions. Inspect `runs/smoke/PROCESS_LOG.md` and the files under `runs/smoke/candidates/`.
 
-### 3. 运行一次单 agent 审计
+### Run a peer swarm
 
-默认使用 `OPENAI_API_KEY`。密钥通过环境变量提供，不要把它写进命令参数或报告：
+Set the API key and model in your local environment:
 
-```shell
+```sh
 export OPENAI_API_KEY='your-api-key'
+export KSCOUT_MODEL='your-model-name'
 
 ./codex-rs/target/debug/codex kernel-vuln \
   --linux-path /path/to/linux \
-  --output-dir ./kscout-workdir \
-  --count 1 \
-  --show-progress
-```
-
-若使用其他兼容 Responses API 的服务，可指定对应环境变量、API 地址和模型：
-
-```shell
-export PROVIDER_API_KEY='your-api-key'
-
-./codex-rs/target/debug/codex kernel-vuln \
-  --api-key-env PROVIDER_API_KEY \
-  --api-base-url https://api.example.com/v1 \
-  --model model-name \
-  --linux-path /path/to/linux \
-  --output-dir ./kscout-workdir \
-  --count 1
-```
-
-在当前工作区使用 DeepSeek 的命令示例（请先在环境中设置 `DEEPSEEK_API_KEY`）：
-
-```shell
-/root/workspace/codex/codex-rs/target/debug/codex kernel-vuln \
-  --api-key-env DEEPSEEK_API_KEY \
-  --api-base-url https://api.deepseek.com \
-  --model deepseek-flash \
-  --disable code_mode_host \
-  --linux-path /root/workspace/linux \
-  --output-dir /root/workspace/kscout-workdir \
-  --count 1 \
-  --show-progress \
-  --stop-on-error
-```
-
-这是与当前开发环境对应的示例；其他 clone 路径下请替换可执行文件和 Linux 源码路径。
-
-## 审计模式
-
-### 单 agent
-
-默认模式下，`--count 1` 安排一个独立候选审计任务。增大 `--count` 会顺序安排更多候选任务；它表示任务数，不代表漏洞数或成功保证。结果可能是 `confirmed`、`plausible`、`negative`、`inconclusive`、重复线索或运行失败。
-
-### Peer swarm
-
-`--swarm` 让多个平等 peer 分轮协作：首轮独立探索，后续按证据缺口挑战线索，同时为新方向保留资源。协调器记录交互轨迹和 Lead 状态，并使用版本化规范调度；Agent 共识不等于外部验证或安全结论。
-
-```shell
-./codex-rs/target/debug/codex kernel-vuln \
-  --linux-path /path/to/linux \
-  --output-dir ./kscout-swarm-run \
+  --output-dir ./runs/swarm \
+  --model "$KSCOUT_MODEL" \
   --count 1 \
   --swarm \
   --swarm-agents 3 \
@@ -98,84 +71,76 @@ export PROVIDER_API_KEY='your-api-key'
   --show-progress
 ```
 
-默认每轮 3 个 peer、最多 2 轮；每轮 Agent 数支持 2–16，单次运行最多 64 个 child session。容量上限不代表已验证 10+ Agent 的效率收益。完整的调度、规范更新、证据状态和限制见[Norm-Guided Adaptive Swarm 当前工作机制](docs/norm-guided-adaptive-swarm.md)。`--multi-agent` 是 `--swarm` 的兼容别名。
+For another supported provider, set its key in an environment variable and add `--api-key-env PROVIDER_API_KEY --api-base-url https://api.example.com/v1`. The key itself is passed through the child environment, not through command-line arguments.
 
-### CVE 派生规则
+To run the single-agent baseline, omit `--swarm`, `--swarm-agents`, and `--swarm-rounds`, and use a separate output directory.
 
-规则模式默认关闭。`--use-cve-rules` 使用维护的 CVE 派生规则审查源码；可以用 `--focus net/sched` 限定子系统，或用 `--cve-rule CVE-2022-0847` 选择 CVE，也可以重复传入多个 `--cve-rule`。此模式下 `--count` 是规则审查总数上限。规则匹配只用于生成审查线索，不等于发现漏洞。
+## Main options
 
-规则来源和验证边界见[操作指南](docs/kernel-vuln-hunt.md)、[CVE/CWE 索引](docs/kernel-cve-cwe-index.md)和[机器可读规则库](KERNEL_CVE_KNOWLEDGE.json)。
-
-## 运行参数
-
-| 参数 | 作用 |
+| Option | Purpose |
 | --- | --- |
-| `--linux-path PATH` | Linux 源码树；建议显式提供。 |
-| `--output-dir DIR` | 报告和运行产物目录；README 示例使用 `./kscout-workdir`，相对于启动命令时的当前目录。 |
-| `--count N` | 单 agent 候选数，或 swarm 组数；规则模式下是规则审查上限。 |
-| `--swarm` | 启用 peer swarm。 |
-| `--swarm-agents N` / `--swarm-rounds N` | 配置每轮并发上限和最大论证轮数；后续轮会动态分配 peer。 |
-| `--prior-finding-index PATH` | 导入先前运行的排重索引或其输出目录；可重复传入。 |
-| `--model NAME` | 覆盖配置文件中的模型。 |
-| `--api-key-env NAME` / `--api-base-url URL` | 选择 API key 环境变量和兼容 API 地址。 |
-| `--focus TEXT` / `--commit REV` | 指定审查主题和优先检查的提交或 revision。 |
-| `--show-progress` | 将 child 的进度和命令输出实时转发到终端；`--verbose` 是别名。 |
-| `--stop-on-error` | child 失败后停止后续候选任务。 |
-| `--dry-run` | 只生成 prompt 和命令，不启动模型。 |
-| `--keep-workspace` | 保留临时 `scratch/`，用于调试；默认清理。 |
+| `--linux-path PATH` | Kernel source tree to analyze. |
+| `--output-dir DIR` | Persistent reports, evidence, and run records. |
+| `--count N` | Number of single-agent passes or swarm groups; in rule mode, the maximum number of grouped rule reviews. |
+| `--swarm` | Enable peer collaboration; `--multi-agent` is a compatibility alias. |
+| `--swarm-agents N` | Maximum concurrent peers per round, from 2 to 16; default: 3. |
+| `--swarm-rounds N` | Maximum rounds per group, from 1 to 4; default: 2. |
+| `--focus TEXT` | Prioritize a subsystem, directory, or topic. |
+| `--commit REV` | Ask agents to prioritize a revision; this does not check out that revision. |
+| `--prior-finding-index PATH` | Import an earlier finding index for duplicate exclusion; repeatable. |
+| `--swarm-norms PATH` | Load a frozen, versioned collaboration policy. |
+| `--swarm-verifier EXECUTABLE` | Use an external verifier implementing the JSON protocol. |
+| `--model NAME` | Select the model for child sessions. |
+| `--show-progress` | Stream child progress while retaining raw logs. |
+| `--dry-run` | Generate run artifacts without model calls. |
+| `--keep-workspace` | Retain temporary `scratch/` directories for investigation. |
 
-完整参数、API 配置、沙箱和 CVE 规则细节见[Linux 漏洞挖掘操作指南](docs/kernel-vuln-hunt.md)。
+The requested swarm session budget, `count × swarm-agents × swarm-rounds`, is limited to 64 sessions per run. Dynamic scheduling and early termination can reduce the number actually launched. `--count` is a workload setting, not an expected number of bugs. See `codex kernel-vuln --help` for all options.
 
-## 输出目录与空间管理
+## Results and evidence
 
-输出目录会包含运行级日志和候选目录，主要文件包括：
+Each output directory contains:
 
-- `PROCESS_LOG.md`：父进程运行时间线、状态和 scratch 清理记录。
-- `USAGE.jsonl`：各候选或 swarm 组的耗时与可用 token usage。
-- `FINDING_INDEX.md`：本输出目录 finding 摘要与显式导入的历史索引，用于提示 agent 排除重复根因。
-- `candidates/candidate-NNN/`：prompt、命令、metadata、完整事件/错误日志、报告和 fingerprint。
-- `candidates/candidate-NNN/agents/round-NN/agent-NN/`：swarm peer 的独立持久工作区和论证记录。
-- `candidates/candidate-NNN/findings/`：符合归档条件的 swarm finding 副本。
+| Path | Contents |
+| --- | --- |
+| `PROCESS_LOG.md` | Run timeline, scheduling decisions, and cleanup records. |
+| `USAGE.jsonl` | Runtime and available model token usage. |
+| `FINDING_INDEX.md` | Finding summaries used to exclude duplicate root causes. |
+| `candidates/candidate-NNN/` | Candidate prompts, commands, reports, and fingerprints. |
+| `candidates/candidate-NNN/SWARM_INDEX.json` | Structured lead and evidence states. |
+| `candidates/candidate-NNN/SWARM_EVENTS.jsonl` | Structured interaction history. |
+| `candidates/candidate-NNN/agents/` | Per-round, per-participant workspaces and logs. |
+| `candidates/candidate-NNN/findings/` | Archived finding submissions and evidence. |
 
-报告、日志、PoC 源码、复现步骤、revision/configuration 信息和正负对照证据会保存在持久目录中，不会为了节省磁盘而压缩或删减文字。临时源码副本、构建树、中间内核、VM 磁盘、临时 rootfs/initramfs 和缓存放在专属 `scratch/` 中：单 agent 完成后清理，swarm 在每轮归档 finding 后清理。若归档失败，swarm 会保留该轮 scratch，避免丢失尚未归档的证据。使用 `--keep-workspace` 可保留 scratch；每个工作区的 `workspace-cleanup.md` 和根级 `PROCESS_LOG.md` 会记录清理结果。
+Agent-reported reproduction, cross-agent reproduction, external runner verification, and security confirmation are distinct states. A successful CLI exit or agreement between agents does not establish a vulnerability. Review the source reasoning, exact kernel revision and configuration, caller privileges, PoC, positive results, and negative controls.
 
-同一输出目录再次运行时，KScout 会跳过已有候选目录并继续分配编号，同时重建排重索引。需要一份独立的实验记录时，请使用新的 `--output-dir`。索引用于提示去重，不保证完全避免重复发现。
+The default child sandbox permits writes to the run workspace and keeps the supplied kernel tree outside its writable roots. Run potentially disruptive kernel tests inside a disposable VM. Reports and evidence are retained; temporary build trees and VM scratch files are cleaned after archival unless `--keep-workspace` is set.
 
-查看一轮运行的状态和产物时，可以从输出目录检查：
+## Code map
 
-```shell
-less ./kscout-workdir/PROCESS_LOG.md
-less ./kscout-workdir/candidates/candidate-001/finding-fingerprint.md
-find ./kscout-workdir/candidates/candidate-001 -maxdepth 4 -type f | sort
-```
+KScout's coordinator is implemented in [`codex-rs/cli/src/`](codex-rs/cli/src/):
 
-## 安全与结果核查
+| Component | Entry point |
+| --- | --- |
+| CLI and run orchestration | [kernel_vuln.rs](codex-rs/cli/src/kernel_vuln.rs) |
+| Peer rounds and finding archival | [kernel_vuln_swarm.rs](codex-rs/cli/src/kernel_vuln_swarm.rs) |
+| Evidence-guided task allocation | [kernel_vuln_swarm_planner.rs](codex-rs/cli/src/kernel_vuln_swarm_planner.rs) |
+| Collaboration norms and policy | [kernel_vuln_swarm_norms.rs](codex-rs/cli/src/kernel_vuln_swarm_norms.rs), [kernel_vuln_swarm_policy.rs](codex-rs/cli/src/kernel_vuln_swarm_policy.rs) |
+| Submission parsing and evidence checks | [kernel_vuln_swarm_protocol.rs](codex-rs/cli/src/kernel_vuln_swarm_protocol.rs) |
+| Reproduction and independent assessment | [kernel_vuln_swarm_consensus.rs](codex-rs/cli/src/kernel_vuln_swarm_consensus.rs), [kernel_vuln_swarm_review.rs](codex-rs/cli/src/kernel_vuln_swarm_review.rs) |
+| Child processes and artifact handling | [kernel_vuln_support.rs](codex-rs/cli/src/kernel_vuln_support.rs), [kernel_vuln_cleanup.rs](codex-rs/cli/src/kernel_vuln_cleanup.rs) |
 
-默认配置不会把 Linux 源码目录加入 child 的可写工作区，研究合同也要求将它作为只读输入。agent 应给出用户态 PoC、可观察 oracle、接近的负对照和重复实验，并披露失败结果与不确定性。不要在宿主机上运行可能导致内核崩溃或状态破坏的触发程序；需要内核触发验证时，应使用可丢弃的隔离 VM。`--dangerously-bypass-approvals-and-sandbox` 会关闭审批和沙箱，因此只应在隔离实验环境中使用。
+The remaining Rust crates provide the underlying agent runtime. Supporting SDKs, build definitions, dependency patches, and third-party assets are retained for workspace tooling and compatibility.
 
-CLI 正常退出或 fingerprint 写有 `confirmed`，都不能单独证明漏洞有效。请检查报告、PoC、原始日志、触发前提、正负对照和复现结果。单 agent 与 swarm 的工作流和限制见[单 agent 工作流](docs/kernel-vuln-workflow.md)及[修改后的 Peer swarm 工作机制](SWARM_WORKFLOW.md)。
+## Documentation
 
-## 源码模块
+- [Running experiments and inspecting results](REPRODUCIBILITY.md)
+- [Swarm workflow, evidence states, and verifier protocol](SWARM_WORKFLOW.md)
+- [Optional CVE-derived rule index](docs/kernel-cve-cwe-index.md)
+- [Machine-readable rule knowledge](KERNEL_CVE_KNOWLEDGE.json)
 
-`codex-rs/cli/src/` 中与 KScout 漏洞审计相关的模块：
+This repository contains the implementation. Original experiment runs, the paper's result tables, and VM images are not bundled; the run instructions describe how to execute and inspect the framework.
 
-- [`kernel_vuln.rs`](codex-rs/cli/src/kernel_vuln.rs)：CLI 参数、运行配置、候选调度和结果汇总。
-- [`kernel_vuln_support.rs`](codex-rs/cli/src/kernel_vuln_support.rs)：prompt 渲染、child 命令构造、进度收集和日志输出。
-- [`kernel_vuln_swarm.rs`](codex-rs/cli/src/kernel_vuln_swarm.rs)：peer 轮次、共享论证板、finding 归档和交叉确认门槛。
-- [`kernel_vuln_swarm_planner.rs`](codex-rs/cli/src/kernel_vuln_swarm_planner.rs)：基于复现与安全影响状态给后续 peer 分配任务。
-- [`kernel_vuln_cleanup.rs`](codex-rs/cli/src/kernel_vuln_cleanup.rs)：校验工作区边界后，仅清理专属 `scratch/` 子目录。
-- `kernel_vuln_rules.rs`、`kernel_vuln_rule_*.rs`：CVE 规则扫描、知识记录、prompt 和报告。
-- `kernel_vuln_dedup.rs`、`kernel_vuln_usage.rs`：finding 索引与耗时/token usage 记录。
+## License and provenance
 
-## 相关文档
-
-- [Linux 内核漏洞挖掘操作指南](docs/kernel-vuln-hunt.md)
-- [单 agent 实际工作流](docs/kernel-vuln-workflow.md)
-- [修改后的 Peer swarm 工作机制](SWARM_WORKFLOW.md)
-- [Peer swarm 工作流与验证边界](docs/kernel-vuln-swarm-workflow.md)
-- [Norm-Guided Adaptive Swarm 当前工作机制](docs/norm-guided-adaptive-swarm.md)
-- [CVE/CWE 索引](docs/kernel-cve-cwe-index.md)
-- [CVE 规则知识库](KERNEL_CVE_KNOWLEDGE.json)
-- [贡献指南](docs/contributing.md)
-
-本项目基于 Codex CLI 运行时。模型和 Codex 配置可参考 [Codex 文档](https://developers.openai.com/codex)。本仓库使用 [Apache-2.0 License](LICENSE)。
+KScout is based on [OpenAI Codex](https://github.com/openai/codex). The repository is distributed under the [Apache License 2.0](LICENSE). Upstream attribution and third-party notices are preserved in [NOTICE](NOTICE) and the relevant dependency directories.
