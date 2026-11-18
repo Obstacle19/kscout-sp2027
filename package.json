@@ -3,8 +3,8 @@
   "private": true,
   "description": "Repository maintenance for the KScout research artifact.",
   "scripts": {
-    "format": "prettier --check *.json *.md docs/*.md **/*.js",
-    "format:fix": "prettier --write *.json *.md docs/*.md **/*.js",
+    "format": "prettier --check *.json *.md **/*.js",
+    "format:fix": "prettier --write *.json *.md **/*.js",
     "write-hooks-schema": "cargo run --manifest-path ./codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures"
   },
   "devDependencies": {

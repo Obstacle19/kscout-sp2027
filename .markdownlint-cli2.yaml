@@ -3,6 +3,3 @@ config:
 
 globs:
   - "README.md"
-  - "REPRODUCIBILITY.md"
-  - "SWARM_WORKFLOW.md"
-  - "docs/kernel-cve-cwe-index.md"
